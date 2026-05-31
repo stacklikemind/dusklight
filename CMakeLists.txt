@@ -100,6 +100,39 @@ project(dusklight LANGUAGES C CXX VERSION ${DUSK_VERSION_STRING})
 if (APPLE)
     enable_language(OBJC OBJCXX)
 endif ()
+
+# visionOS scene-activation seam: the SwiftUI @main app (src/dusk/vision/DuskVisionApp.swift) needs
+# the Swift language enabled. Swift must be enabled here (top-level, right after project()) -- doing
+# it later via enable_language() mid-configure fails ("No CMAKE_Swift_COMPILER could be found") with
+# the Ninja generator + the ios.toolchain (which only configures C/CXX/OBJC). With Ninja, CMake also
+# does not auto-discover swiftc the way the Xcode generator does, so point it at the xrOS toolchain's
+# swiftc explicitly. visionOS-only; no effect on any other platform.
+if (VISIONOS)
+    if (NOT CMAKE_Swift_COMPILER)
+        execute_process(COMMAND xcrun --sdk xros --find swiftc
+            OUTPUT_VARIABLE _dusk_swiftc OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if (_dusk_swiftc)
+            set(CMAKE_Swift_COMPILER "${_dusk_swiftc}" CACHE FILEPATH "Swift compiler (xrOS)")
+        endif ()
+    endif ()
+    # The ios.toolchain only configures C/CXX/OBJC; it never teaches CMake the Swift cross-compile
+    # triple, so CMake's Swift compiler probe defaults to the host (arm64-apple-macosx) and fails to
+    # load the macOS standard library against the XROS sysroot ("unable to load standard library for
+    # target 'arm64-apple-macosx...'"). Pin the Swift -target to the visionOS triple explicitly. The
+    # device triple is arm64-apple-xros<deployment>; the simulator adds the -simulator suffix.
+    if (NOT DEFINED DEPLOYMENT_TARGET OR DEPLOYMENT_TARGET STREQUAL "")
+        set(_dusk_swift_deploy "2.0")
+    else ()
+        set(_dusk_swift_deploy "${DEPLOYMENT_TARGET}")
+    endif ()
+    if (CMAKE_SYSTEM_NAME STREQUAL visionOS AND CMAKE_OSX_SYSROOT MATCHES "Simulator")
+        set(_dusk_swift_target "arm64-apple-xros${_dusk_swift_deploy}-simulator")
+    else ()
+        set(_dusk_swift_target "arm64-apple-xros${_dusk_swift_deploy}")
+    endif ()
+    string(APPEND CMAKE_Swift_FLAGS " -target ${_dusk_swift_target} -sdk ${CMAKE_OSX_SYSROOT}")
+    enable_language(Swift)
+endif ()
 # Adjust CMAKE_SYSTEM_PROCESSOR on Windows to match compiler target
 include(cmake/WindowsTargetProcessor.cmake)
 if (APPLE AND NOT TVOS AND CMAKE_SYSTEM_NAME STREQUAL tvOS)
@@ -225,7 +258,12 @@ if (CMAKE_SYSTEM_NAME STREQUAL Linux)
     set(CMAKE_INSTALL_RPATH "$ORIGIN")
     set(CMAKE_BUILD_RPATH "$ORIGIN")
 elseif (APPLE)
-    add_compile_options(-Wno-declaration-after-statement -Wno-non-pod-varargs)
+    # Scope these clang warning flags to C/C++ only. They are clang-specific and break the Swift
+    # compiler ("unknown argument: '-Wno-declaration-after-statement'"), which only participates in
+    # the build on visionOS (the SwiftUI @main app). For C/C++/ObjC the effect is unchanged.
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:-Wno-declaration-after-statement>
+        $<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:-Wno-non-pod-varargs>)
     set(CMAKE_INSTALL_RPATH "$ORIGIN")
     set(CMAKE_BUILD_RPATH "$ORIGIN")
 elseif (MSVC)
@@ -294,7 +332,9 @@ endif ()
 # Use signed char on ARM to match the original game (and x86)
 string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _arch)
 if(_arch MATCHES "^(arm|aarch64)" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
-    add_compile_options(-fsigned-char)
+    # Scope to C-family languages: -fsigned-char is a clang flag the Swift compiler rejects, and
+    # Swift only participates in the visionOS build.
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:-fsigned-char>)
 endif()
 
 if (CMAKE_SYSTEM_NAME STREQUAL Windows)
@@ -592,6 +632,92 @@ if (IOS OR VISIONOS)
     target_sources(dusklight PRIVATE src/dusk/ios/FileSelectDialog.m)
     set_source_files_properties(src/dusk/ios/FileSelectDialog.m PROPERTIES COMPILE_FLAGS -fobjc-arc)
     target_link_libraries(dusklight PRIVATE ${UIKIT_FRAMEWORK} ${UNIFORM_TYPE_IDENTIFIERS_FRAMEWORK})
+endif ()
+
+if (VISIONOS)
+    # visionOS stereoscopic present plumbing: IOSurface<->Dawn shared-texture bridge and the
+    # CompositorServices present loop. These reach into Aurora's webgpu globals (lib/webgpu/gpu.hpp)
+    # and Dawn's webgpu_cpp.h.
+    find_library(METAL_FRAMEWORK Metal REQUIRED)
+    find_library(IOSURFACE_FRAMEWORK IOSurface REQUIRED)
+    find_library(COMPOSITOR_SERVICES_FRAMEWORK CompositorServices REQUIRED)
+    target_sources(dusklight PRIVATE
+        src/dusk/vision/StereoBridge.mm
+        src/dusk/vision/StereoPresent.mm)
+
+    # ---------------------------------------------------------------------------------------------
+    # Scene-activation seam: SwiftUI @main app + ImmersiveSpace/CompositorLayer. visionOS-only.
+    # The Swift App provides the process entry point (replacing aurora's int main, which is pulled
+    # from the aurora::main static archive only if `main` is otherwise undefined; Swift's @main
+    # defines `main`, so the archive member is not extracted and there is no duplicate-symbol clash).
+    # The Swift code calls plain-C shims (StereoEntry.h) implemented in StereoPresent.mm.
+    # (Swift language is enabled near the top-level project() call -- see above.)
+    # ---------------------------------------------------------------------------------------------
+    # The Swift @main app is built as its OWN static library, NOT added to `dusklight` directly.
+    # Reason: a target's COMPILE_OPTIONS/COMPILE_DEFINITIONS are forwarded to *every* language in
+    # that target, so the game's C/C++ flags (GAME_COMPILE_FLAGS, e.g. -Wno-declaration-after-statement)
+    # and defines (-DVERSION=0 ...) would leak into the swiftc invocation. swiftc hard-errors on the
+    # clang-only warning flag ("unknown argument: '-Wno-declaration-after-statement'") and warns on the
+    # -D defines. An isolated library keeps the Swift compile clean. The library is then linked into
+    # dusklight, where Swift's @main provides the process `main`.
+    set(DUSK_SWIFT_BRIDGING_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/src/dusk/vision/StereoEntry.h)
+    # Cross-compiled Swift under the ios.toolchain needs the target triple + sysroot passed
+    # explicitly (the toolchain file only configures C/C++/ObjC). DEPLOYMENT_TARGET comes from the
+    # preset (e.g. 2.0). PLATFORM distinguishes device vs simulator.
+    if (PLATFORM STREQUAL "SIMULATOR_VISIONOS")
+        set(DUSK_SWIFT_TRIPLE "arm64-apple-xros${DEPLOYMENT_TARGET}-simulator")
+    else ()
+        set(DUSK_SWIFT_TRIPLE "arm64-apple-xros${DEPLOYMENT_TARGET}")
+    endif ()
+    add_library(dusk_vision_swift STATIC src/dusk/vision/DuskVisionApp.swift)
+    target_compile_options(dusk_vision_swift PRIVATE
+        "$<$<COMPILE_LANGUAGE:Swift>:-target;${DUSK_SWIFT_TRIPLE};-sdk;${CMAKE_OSX_SYSROOT};-import-objc-header;${DUSK_SWIFT_BRIDGING_HEADER}>")
+    # The bridging header pulls in StereoEntry.h, which needs TARGET_OS_VISION resolved the same way
+    # the C/ObjC side sees it; no game defines required here.
+    target_link_libraries(dusklight PRIVATE dusk_vision_swift)
+    # Link the executable with the C++ driver (clang++), NOT swiftc. CMake otherwise auto-selects the
+    # Swift driver because a Swift library is linked in, but swiftc rejects the clang/ld-style flags
+    # that abseil/Dawn inject into the link line (e.g. "-Wl,-framework,CoreFoundation"), failing the
+    # final link. clang++ accepts those flags; the Swift runtime is then resolved via autolink
+    # (LC_LINKER_OPTION entries baked into the Swift objects, e.g. -lswiftCore) against the SDK's Swift
+    # stub dir below.
+    set_target_properties(dusklight PROPERTIES LINKER_LANGUAGE CXX)
+    # clang++ needs the Swift runtime stub (.tbd) search path so autolinked -lswift* resolve, plus an
+    # rpath to the OS Swift runtime (shipped in /usr/lib/swift on visionOS). ${CMAKE_OSX_SYSROOT} is
+    # the XROS SDK; .../usr/lib/swift holds libswiftCore.tbd et al.
+    target_link_options(dusklight PRIVATE
+        # Force the Swift object's `main` (and the @main scaffolding) to be retained even though the
+        # static lib's symbols would otherwise be pulled only on demand. -force_load guarantees the
+        # Swift @main entry point is present so it -- not aurora::main's `int main` -- is the process entry.
+        "SHELL:-Xlinker -force_load -Xlinker $<TARGET_FILE:dusk_vision_swift>"
+        "SHELL:-L ${CMAKE_OSX_SYSROOT}/usr/lib/swift"
+        "SHELL:-Xlinker -rpath -Xlinker /usr/lib/swift")
+    # ObjC ARC: the bridge uses CFBridgingRetain/__bridge casts (with matching manual CFRelease).
+    # SKIP_PRECOMPILE_HEADERS: the C++ (non-ARC) PCH poisons __has_feature(objc_arc) for headers
+    # pulled in afterward, which hides CompositorServices' ARC-gated cp_layer_renderer_state enum.
+    set_source_files_properties(
+        src/dusk/vision/StereoBridge.mm
+        src/dusk/vision/StereoPresent.mm
+        PROPERTIES COMPILE_FLAGS -fobjc-arc
+        SKIP_PRECOMPILE_HEADERS ON)
+    # Aurora's lib dir (gpu.hpp) plus Dawn's webgpu headers. Dawn's include dirs are PRIVATE to the
+    # aurora targets, so pull them off the vendored webgpu_dawn target's interface includes.
+    target_include_directories(dusklight PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/extern/aurora/lib)
+    if (TARGET webgpu_dawn)
+        target_include_directories(dusklight PRIVATE
+            $<TARGET_PROPERTY:webgpu_dawn,INTERFACE_INCLUDE_DIRECTORIES>)
+    endif ()
+    # Fallback for the vendored Dawn source build: the generated C++ header lives under the build
+    # tree (dawn-build/gen) and the C header under the source tree (dawn-src).
+    foreach (_dawn_inc
+            ${CMAKE_BINARY_DIR}/_deps/dawn-src/include
+            ${CMAKE_BINARY_DIR}/_deps/dawn-build/gen/include)
+        if (EXISTS ${_dawn_inc})
+            target_include_directories(dusklight PRIVATE ${_dawn_inc})
+        endif ()
+    endforeach ()
+    target_link_libraries(dusklight PRIVATE
+        ${METAL_FRAMEWORK} ${IOSURFACE_FRAMEWORK} ${COMPOSITOR_SERVICES_FRAMEWORK})
 endif ()
 
 include(extern/aurora/cmake/AuroraCopyRuntimeDLLs.cmake)
