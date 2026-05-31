@@ -17,6 +17,10 @@
 
 import SwiftUI
 import CompositorServices
+import Foundation
+
+// Identifier for the transient launch window so we can dismiss it once the immersive space opens.
+private let kLaunchWindowID = "DuskLaunch"
 
 // MARK: - Engine bootstrap
 
@@ -72,11 +76,13 @@ struct DuskCompositorContent: CompositorContent {
 @main
 struct DuskVisionApp: App {
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
+    @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some Scene {
         // visionOS apps need an initial windowed scene; this tiny window requests the immersive
-        // space on appear and then effectively gets out of the way.
-        WindowGroup {
+        // space on appear and then dismisses itself so the game (presented into the immersive
+        // CompositorLayer) isn't occluded by the launch placeholder.
+        WindowGroup(id: kLaunchWindowID) {
             LaunchView()
                 .task {
                     // Boot the engine only AFTER the app/scene is up. The engine runs on a background
@@ -86,7 +92,21 @@ struct DuskVisionApp: App {
                     // (the UIApplication/scene was not ready and SDL video init aborted). .task runs on
                     // the main actor once the scene appears -- the correct, late-enough kickoff point.
                     startEngineOnce()
-                    _ = await openImmersiveSpace(id: "DuskStereo")
+                    let result = await openImmersiveSpace(id: "DuskStereo")
+                    switch result {
+                    case .opened:
+                        NSLog("[dusk::vision] openImmersiveSpace(DuskStereo): opened")
+                        // NOTE: keep the launch window for now. Dismissing it can drop the app's
+                        // last foreground scene before the immersive content is actually presenting,
+                        // which (on device) lets the app background and stops world tracking. Re-add
+                        // dismissal once the immersive stereo present is confirmed rendering.
+                    case .userCancelled:
+                        NSLog("[dusk::vision] openImmersiveSpace(DuskStereo): userCancelled")
+                    case .error:
+                        NSLog("[dusk::vision] openImmersiveSpace(DuskStereo): ERROR")
+                    @unknown default:
+                        NSLog("[dusk::vision] openImmersiveSpace(DuskStereo): unknown result")
+                    }
                 }
         }
         .windowResizability(.contentSize)

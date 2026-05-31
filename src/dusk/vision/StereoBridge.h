@@ -15,6 +15,7 @@
 #if defined(__APPLE__) && defined(TARGET_OS_VISION) && TARGET_OS_VISION
 
 #include <cstdint>
+#include <mutex>
 
 #include <IOSurface/IOSurfaceRef.h>
 #include <webgpu/webgpu_cpp.h>
@@ -67,6 +68,13 @@ public:
   // After endAccess(), the MTLSharedEvent the present command buffer should wait on, and the value
   // it will be signaled with. Returns nil/0 if no fence was produced (see TODO in the .mm).
   id<MTLSharedEvent> lastEndAccessSharedEvent() const noexcept;
+
+  // Thread-safe combined fetch of the latest end-access fence (event + value), read together under a
+  // lock so the present thread never pairs a stale value with a newer event (which could make it wait
+  // on a signal that never arrives). endAccess() (engine thread) publishes them under the same lock.
+  // Returns false if no fence has been produced yet. The returned event is retained into the caller
+  // (ARC), so it stays alive even if the engine thread replaces it concurrently.
+  bool latestEndAccessFence(id<MTLSharedEvent>* outEvent, uint64_t* outValue) const noexcept;
 #endif
   uint64_t lastEndAccessSignaledValue() const noexcept { return m_lastSignaledValue; }
 
@@ -83,6 +91,10 @@ private:
   void* m_metalTexture = nullptr;        // id<MTLTexture> (CFBridgingRetain'd)
   void* m_lastEndAccessEvent = nullptr;  // id<MTLSharedEvent> (CFBridgingRetain'd)
   uint64_t m_lastSignaledValue = 0;
+
+  // Guards the cross-thread fence fields above (m_lastEndAccessEvent / m_lastSignaledValue): written
+  // by endAccess() on the engine thread, read by latestEndAccessFence() on the present thread.
+  mutable std::mutex m_fenceMutex;
 };
 
 }  // namespace dusk::vision

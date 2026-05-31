@@ -641,6 +641,7 @@ if (VISIONOS)
     find_library(METAL_FRAMEWORK Metal REQUIRED)
     find_library(IOSURFACE_FRAMEWORK IOSurface REQUIRED)
     find_library(COMPOSITOR_SERVICES_FRAMEWORK CompositorServices REQUIRED)
+    find_library(ARKIT_FRAMEWORK ARKit REQUIRED)
     target_sources(dusklight PRIVATE
         src/dusk/vision/StereoBridge.mm
         src/dusk/vision/StereoPresent.mm)
@@ -717,7 +718,7 @@ if (VISIONOS)
         endif ()
     endforeach ()
     target_link_libraries(dusklight PRIVATE
-        ${METAL_FRAMEWORK} ${IOSURFACE_FRAMEWORK} ${COMPOSITOR_SERVICES_FRAMEWORK})
+        ${METAL_FRAMEWORK} ${IOSURFACE_FRAMEWORK} ${COMPOSITOR_SERVICES_FRAMEWORK} ${ARKIT_FRAMEWORK})
 endif ()
 
 include(extern/aurora/cmake/AuroraCopyRuntimeDLLs.cmake)

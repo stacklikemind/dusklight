@@ -22,15 +22,18 @@ namespace dusk::vision {
 
 #ifdef __OBJC__
 // Drive one full CompositorServices frame: query/wait frame, query drawable, iterate eye views, and
-// for each view blit `eye`'s IOSurface-backed MTLTexture into the drawable's color texture, then
-// encode-present. Returns false when the layer is no longer running (caller should stop the loop).
+// for each view blit the shared eye texture's IOSurface-backed MTLTexture into the drawable's color
+// texture, then encode-present. Returns false when the layer is no longer running (caller should stop
+// the loop). Until the engine thread has imported the shared eye texture, it publishes a sized
+// IOSurface for the engine and presents empty drawables.
 //
-// For the scaffold the same `eye` texture is blitted into every view (mono into both eyes).
-bool presentStereoFrame(cp_layer_renderer_t layerRenderer, SharedEyeTexture& eye) noexcept;
+// The shared eye texture is a module global fed by the engine thread (see StereoEngine.h); for the
+// scaffold the same (mono) texture is blitted into every view.
+bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept;
 
 // Blocking render loop wrapper: spins presentStereoFrame() until the layer is invalidated. Intended
 // to be run on a dedicated render thread owned by the immersive scene.
-void runStereoPresentLoop(cp_layer_renderer_t layerRenderer, SharedEyeTexture* eye) noexcept;
+void runStereoPresentLoop(cp_layer_renderer_t layerRenderer) noexcept;
 #endif
 
 // Request that the immersive scene be created/activated. See StereoPresent.mm for the (currently

@@ -58,6 +58,9 @@
 #include "dusk/imgui/ImGuiConsole.hpp"
 #include "dusk/imgui/ImGuiEngine.hpp"
 #include "dusk/iso_validate.hpp"
+#if defined(__APPLE__) && defined(TARGET_OS_VISION) && TARGET_OS_VISION
+#include "dusk/vision/StereoEngine.h"
+#endif
 #include "dusk/logging.h"
 #include "dusk/main.h"
 #include "dusk/ui/menu_bar.hpp"
@@ -190,7 +193,13 @@ bool launchUILoop() {
         dusk::g_imguiConsole.PreDraw();
         dusk::g_imguiConsole.PostDraw();
 
+#if defined(__APPLE__) && defined(TARGET_OS_VISION) && TARGET_OS_VISION
+        dusk::vision::stereo_engine_frame_begin();
+#endif
         aurora_end_frame();
+#if defined(__APPLE__) && defined(TARGET_OS_VISION) && TARGET_OS_VISION
+        dusk::vision::stereo_engine_frame_end();
+#endif
     }
 
     return dusk::IsRunning;
@@ -335,7 +344,13 @@ void main01(void) {
             main_loop_limiter.Reset();
         }
 
+#if defined(__APPLE__) && defined(TARGET_OS_VISION) && TARGET_OS_VISION
+        dusk::vision::stereo_engine_frame_begin();
+#endif
         aurora_end_frame();
+#if defined(__APPLE__) && defined(TARGET_OS_VISION) && TARGET_OS_VISION
+        dusk::vision::stereo_engine_frame_end();
+#endif
 
 
         FrameMark;

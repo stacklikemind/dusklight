@@ -122,12 +122,6 @@ bool SharedEyeTexture::endAccess() noexcept {
   if (m_memory == nullptr || m_texture == nullptr) {
     return false;
   }
-  // Drop any previously exported fence.
-  if (m_lastEndAccessEvent != nullptr) {
-    CFRelease(m_lastEndAccessEvent);
-    m_lastEndAccessEvent = nullptr;
-  }
-  m_lastSignaledValue = 0;
 
   wgpu::SharedTextureMemoryEndAccessState end{};
   if (m_memory.EndAccess(m_texture, &end) != wgpu::Status::Success) {
@@ -137,21 +131,58 @@ bool SharedEyeTexture::endAccess() noexcept {
 
   // Export the first produced fence as an MTLSharedEvent so the present command buffer can wait on
   // it before reading the IOSurface. Dawn produces SharedFenceMTLSharedEvent fences when the
-  // SharedFenceMTLSharedEvent device feature is enabled (it is; see gpu.cpp).
+  // SharedFenceMTLSharedEvent device feature is enabled (it is; see gpu.cpp). Compute the new fence
+  // into locals first, then publish under the lock so the present thread always reads a matched
+  // (event, value) pair.
+  id<MTLSharedEvent> newEvent = nil;
+  uint64_t newValue = 0;
   if (end.fenceCount > 0 && end.fences != nullptr) {
     wgpu::SharedFenceMTLSharedEventExportInfo mtlExport;
     wgpu::SharedFenceExportInfo exportInfo{};
     exportInfo.nextInChain = &mtlExport;
     end.fences[0].ExportInfo(&exportInfo);
     if (mtlExport.sharedEvent != nullptr) {
-      id<MTLSharedEvent> evt = (__bridge id<MTLSharedEvent>)mtlExport.sharedEvent;
-      m_lastEndAccessEvent = (void*)CFBridgingRetain(evt);
-      m_lastSignaledValue = (end.signaledValues != nullptr) ? end.signaledValues[0] : 0;
+      newEvent = (__bridge id<MTLSharedEvent>)mtlExport.sharedEvent;
+      newValue = (end.signaledValues != nullptr) ? end.signaledValues[0] : 0;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lk(m_fenceMutex);
+    if (m_lastEndAccessEvent != nullptr) {
+      CFRelease(m_lastEndAccessEvent);
+      m_lastEndAccessEvent = nullptr;
+    }
+    m_lastSignaledValue = newValue;
+    if (newEvent != nil) {
+      m_lastEndAccessEvent = (void*)CFBridgingRetain(newEvent);
     }
   }
   // TODO(stereo): if no MTLSharedEvent fence was produced, the present side must fall back to a
   // coarse device/queue poll (e.g. wait on a committed empty command buffer) before reading the
   // IOSurface. The fence-based path above is preferred and is what gpu.cpp's feature request enables.
+  return true;
+}
+
+bool SharedEyeTexture::latestEndAccessFence(id<MTLSharedEvent>* outEvent,
+                                            uint64_t* outValue) const noexcept {
+  std::lock_guard<std::mutex> lk(m_fenceMutex);
+  if (m_lastEndAccessEvent == nullptr) {
+    if (outEvent != nullptr) {
+      *outEvent = nil;
+    }
+    if (outValue != nullptr) {
+      *outValue = 0;
+    }
+    return false;
+  }
+  // The __bridge cast hands ARC a +0 reference; assigning it to the caller's strong out-param retains
+  // it, so the event survives even if a concurrent endAccess() CFReleases this object's reference.
+  if (outEvent != nullptr) {
+    *outEvent = (__bridge id<MTLSharedEvent>)m_lastEndAccessEvent;
+  }
+  if (outValue != nullptr) {
+    *outValue = m_lastSignaledValue;
+  }
   return true;
 }
 
