@@ -112,12 +112,23 @@ Recipes/IDs in memory: `visionos-build-recipe`, `visionos-device-signing`, `visi
 
 ## NEXT 3 STEPS (resume here)
 
-1. **Make the diagnostics non-capped.** In `src/dusk/vision/StereoPresent.mm` the `static int s_… < N`
-   caps (`s_drawLogged<3`, `s_blitLogged<2`, `s_anchorLogged<6`) silence after a few prints — change
-   to periodic (e.g. log when `frameCount % 120 == 0`). Add a one-shot **NSLog** (public ints, so it's
-   visible in Console.app) inside `stereo_engine_frame_begin` on IOSurface import success/failure.
-   Rebuild → device → Console.app. Goal: see whether `eyeReady` ever flips to `1` and whether the blit
-   runs over time.
+1. **DONE (2026-05-31 23:1x): diagnostics uncapped + engine heartbeat added; built/signed/installed.**
+   All `StereoPresent.mm` diagnostics are now periodic (`< 5 || %300`) and on NSLog (device-visible):
+   `engine_frame_begin #N` (the key heartbeat — proves the engine thread reaches `aurora_end_frame`),
+   `device anchor tracked=N`, `drawables=… eyeReady=N`, `blitted eye …`. Engine import logs
+   `engine imported … ARMED` / `engine FAILED to import`. **AWAITING a headset-on device run + Console
+   capture** to read these. Interpreting the next capture (filter `dusk::vision`):
+   - **No `engine_frame_begin #…` at all** → the engine background thread isn't running its frame loop
+     on device (the real bug). Then trace: does `dusk_vision_run_engine`→`aurora_main`→`game_main`
+     reach `launchUILoop`/`main01`? Suspect the `dispatch_sync(main)` in `ensureWorldTracking`
+     deadlocking/contending with the engine's own marshal-to-main SDL init.
+   - **`engine_frame_begin` present but `pendingSurface=0` forever** → the present thread never
+     published the IOSurface (look for `published …x… eye IOSurface`); check the present loop reached
+     the publish path (needs a drawable with non-zero color tex).
+   - **`pendingSurface=1` but `engineInit=0` / `engine FAILED to import`** → `SharedEyeTexture::init`
+     (Dawn `ImportSharedTextureMemory`) fails on device → investigate that.
+   - **`eyeReady=1` + `blitted eye …` but still black** → content IS flowing; problem is elsewhere
+     (e.g. the captured frame itself empty, or sRGB/format). Different bug than expected.
 2. **Find why the engine never feeds the eye on device.** Last device run showed `eyeReady=0` and no
    `blitted eye` line for 18 s, while the sim reaches `eyeReady=1` fast. So `stereo_engine_frame_begin`
    isn't importing the published IOSurface on device. Check: is the engine background thread actually

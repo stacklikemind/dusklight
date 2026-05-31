@@ -55,7 +55,7 @@ void ensureWorldTracking() {
     return;
   }
   if (!ar_world_tracking_provider_is_supported()) {
-    fprintf(stderr, "[dusk::vision] world tracking unsupported; drawables will lack a device anchor\n");
+    NSLog(@"[dusk::vision] world tracking unsupported; drawables will lack a device anchor");
     return;
   }
   // Start the ARKit session on the MAIN thread. ar_session_run kicks off an async authorization +
@@ -71,7 +71,7 @@ void ensureWorldTracking() {
     g_arSession = ar_session_create();
     ar_session_run(g_arSession, g_dataProviders);
   });
-  fprintf(stderr, "[dusk::vision] ARKit world tracking session started on main thread\n");
+  NSLog(@"[dusk::vision] ARKit world tracking session started on main thread");
 }
 
 // Attach a device anchor to the drawable so the compositor will present it. The compositor drops any
@@ -99,10 +99,10 @@ bool attachDeviceAnchor(cp_drawable_t drawable) {
   if (ok) {
     cp_drawable_set_device_anchor(drawable, anchor);
   }
-  static int s_anchorLogged = 0;
-  if (s_anchorLogged < 6) {
-    ++s_anchorLogged;
-    NSLog(@"[dusk::vision] device anchor tracked=%d", ok ? 1 : 0);
+  static unsigned long s_anchorFrames = 0;
+  const unsigned long anchorN = s_anchorFrames++;
+  if (anchorN < 5 || (anchorN % 300) == 0) {
+    NSLog(@"[dusk::vision] device anchor tracked=%d (frame #%lu)", ok ? 1 : 0, anchorN);
   }
   return ok;
 }
@@ -151,7 +151,7 @@ static bool publishEyeSurfaceIfNeeded(cp_drawable_t drawable) noexcept {
   // SharedEyeTexture::init CFRetains it; our +1 is intentionally leaked for the process-lifetime
   // scaffold rather than racing a CFRelease against the import.
   g_pendingIOSurface.store(surface, std::memory_order_release);
-  fprintf(stderr, "[dusk::vision] published %ux%u eye IOSurface for engine import\n", w, h);
+  NSLog(@"[dusk::vision] published %ux%u eye IOSurface for engine import", w, h);
   return true;
 }
 
@@ -233,11 +233,12 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
     return true;
   }
 
-  // One-shot diagnostic (public ints -> visible un-redacted in Console.app). Confirms the drawable
-  // structure on device, especially whether a depth texture must be written before present.
-  static int s_drawLogged = 0;
-  if (s_drawLogged < 3) {
-    ++s_drawLogged;
+  // Periodic diagnostic (public ints -> visible un-redacted in Console.app). Confirms the drawable
+  // structure AND how eyeReady evolves over time (capped logging hid the moment it flips). First few
+  // frames, then every ~300.
+  static unsigned long s_drawFrames = 0;
+  const unsigned long drawN = s_drawFrames++;
+  if (drawN < 5 || (drawN % 300) == 0) {
     cp_drawable_t d0 = drawables[0];
     const size_t texCount = cp_drawable_get_texture_count(d0);
     const size_t viewCount = cp_drawable_get_view_count(d0);
@@ -319,14 +320,17 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
       }
     }
     [blit endEncoding];
-    static int s_blitLogged = 0;
-    if (s_blitLogged < 2) {
-      ++s_blitLogged;
-      NSLog(@"[dusk::vision] blitted eye %lux%lu into drawable views",
-            (unsigned long)srcTex.width, (unsigned long)srcTex.height);
+    static unsigned long s_blitFrames = 0;
+    const unsigned long blitN = s_blitFrames++;
+    if (blitN < 5 || (blitN % 300) == 0) {
+      NSLog(@"[dusk::vision] blitted eye %lux%lu into drawable views (frame #%lu)",
+            (unsigned long)srcTex.width, (unsigned long)srcTex.height, blitN);
     }
   } else {
-    NSLog(@"[dusk::vision] presentStereoFrame: eye MTLTexture unavailable");
+    static unsigned long s_noTexFrames = 0;
+    if ((s_noTexFrames++ % 300) == 0) {
+      NSLog(@"[dusk::vision] presentStereoFrame: eye MTLTexture unavailable");
+    }
   }
 
   // Always encode_present + commit (CompositorServices contract; skipping aborts end_submission).
@@ -364,6 +368,16 @@ void runStereoPresentLoop(cp_layer_renderer_t layerRenderer) noexcept {
 // Dawn device is engine-thread-only; see StereoEngine.h for the full rationale.
 // ----------------------------------------------------------------------------------------------
 void stereo_engine_frame_begin() noexcept {
+  // Heartbeat: proves the ENGINE thread is actually reaching aurora_end_frame on device. If this
+  // never appears in Console.app, the engine frame loop isn't running -- the real bug. NSLog (not
+  // fprintf/stderr) so it shows on device. First few frames, then every ~300.
+  static unsigned long s_engineFrames = 0;
+  const unsigned long engN = s_engineFrames++;
+  if (engN < 5 || (engN % 300) == 0) {
+    NSLog(@"[dusk::vision] engine_frame_begin #%lu: pendingSurface=%d engineInit=%d eyeReady=%d", engN,
+          g_pendingIOSurface.load(std::memory_order_acquire) != nullptr ? 1 : 0,
+          g_engineInitDone ? 1 : 0, g_eyeReady.load(std::memory_order_acquire) ? 1 : 0);
+  }
   if (!g_engineInitDone) {
     IOSurfaceRef surface = g_pendingIOSurface.load(std::memory_order_acquire);
     if (surface != nullptr) {
@@ -375,13 +389,12 @@ void stereo_engine_frame_begin() noexcept {
         aurora::webgpu::set_stereo_capture_target(g_eye.view(), w, h);
         g_engineInitDone = true;
         g_eyeReady.store(true, std::memory_order_release);
-        fprintf(stderr, "[dusk::vision] engine imported %ux%u eye texture; stereo capture armed\n", w,
-                h);
+        NSLog(@"[dusk::vision] engine imported %ux%u eye texture; stereo capture ARMED", w, h);
       } else {
         // Import failed: drop the pending surface so we don't retry every frame, and leave the
         // capture target unset (the engine keeps presenting mono to its flat surface).
         g_pendingIOSurface.store(nullptr, std::memory_order_release);
-        fprintf(stderr, "[dusk::vision] engine failed to import eye texture; stereo present disabled\n");
+        NSLog(@"[dusk::vision] engine FAILED to import eye texture; stereo capture disabled");
       }
     }
   }
@@ -453,7 +466,7 @@ extern "C" void dusk_vision_start_present(DuskLayerRendererHandle layerRendererH
   // stereo_engine_frame_begin) so the resolved game frame is blitted into it, and the loop then
   // presents that real frame into both eyes. Until the engine signals readiness, the loop presents
   // empty drawables (brief black) -- see presentStereoFrame().
-  fprintf(stderr, "[dusk::vision] dusk_vision_start_present: entering CompositorServices present loop\n");
+  NSLog(@"[dusk::vision] dusk_vision_start_present: entering CompositorServices present loop");
   // Start ARKit world tracking on this (present) thread so each drawable can carry a device anchor;
   // the device compositor drops anchorless drawables.
   dusk::vision::ensureWorldTracking();
