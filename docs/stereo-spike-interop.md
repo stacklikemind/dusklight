@@ -721,3 +721,46 @@ submodule (the `lib/aurora.cpp` capture-source fix from §9.11 — commit inside
 `StereoEngine.h`, `src/m_Do/m_Do_main.cpp`, `src/dusk/vision/DuskVisionApp.swift`, `CMakeLists.txt`
 (ARKit framework + the engine-hook wiring), `platforms/visionos/Info.plist.in`
 (`UIApplicationSupportsMultipleScenes=true`), and this doc.
+
+### 9.17 ★ ROOT CAUSE localized: layer LAYOUT mismatch (2026-06-01 ~00:50)
+
+Two device runs this session, interpreted with the systematic-debugging skill:
+
+1. **`.immersionStyle(.full)` fix (real progress):** added `.immersionStyle(selection: .constant(.full), in: .full)`
+   + `.upperLimbVisibility(.hidden)` to the `ImmersiveSpace` in `DuskVisionApp.swift`. Without it the space
+   defaulted to **mixed** and the CompositorLayer was never composited (SurfBoard logs literally said
+   `immersiveStyle = Mixed`). After the fix the **immersive space now actually opens full** on device.
+
+2. **Forced-clear bisection (decisive):** `kForceEyeClearTest` in `StereoPresent.mm` clears each eye slice
+   to OPAQUE red(L)/blue(R) via a render pass, bypassing the IOSurface/game entirely. On device this is
+   **STILL BLACK**, while logs show the clear runs every frame, `cp_drawable_encode_present` succeeds,
+   `device anchor tracked=1`, `eyeReady=1`, full immersion open. → The bug is **NOT** content / alpha /
+   the IOSurface pipeline (all proven green). Our **per-frame render into the drawable isn't being
+   scanned out.**
+
+Ruled out by reading the XROS 26.5 SDK headers (no guessing):
+- `cp_drawable_get_color_texture` IS the correct render destination (drawable.h confirms it).
+- The Metal-4 `cp_drawable_create_render_context` is only "when you adopt Metal 4"; the traditional
+  `cp_drawable_encode_present` path we use is correct.
+
+**ROOT CAUSE (high confidence): layer LAYOUT mismatch.** `layer_renderer_layout.h`:
+`dedicated=0` (one texture per view), `shared=1`, `layered=2` (one 2D-array texture, slice per view).
+- **Sim** gave `texCount=2` = **dedicated** → our per-view-texture blit path WORKED (game showed, §9.10).
+- **Device** gives `texCount=1, viewCount=2` = **layered** → our code writes two separate single-slice
+  render passes into the array texture, which the device does not scan out. A bare `CompositorLayer { }`
+  picks the device-default (layered); we never configured the layout.
+
+**NEXT STEP (concrete, do first next session):** configure the CompositorLayer for the **dedicated**
+layout so the device uses the same per-view-texture path proven on the sim — i.e. give `CompositorLayer`
+a `CompositorLayerConfiguration` that sets `configuration.layout = .dedicated` (Swift) in
+`DuskVisionApp.swift` (replace the bare `CompositorLayer { layerRenderer in … }` with the
+`CompositorLayer(configuration:) { … }` form; make the configuration type set `.layout = .dedicated`,
+and also set color/depth formats + foveation there). Keep `kForceEyeClearTest = true` for the first
+verification run: success = your whole view fills red(L)/blue(R). Then flip it false for the real game
+frame. If dedicated still fails, implement proper LAYERED rendering instead (single render pass,
+`renderPassDescriptor.renderTargetArrayLength = viewCount`, view-texture-map, rasterization rate map).
+
+This is the 4th distinct device-only compositor requirement uncovered (drawables-array → device-anchor →
+layered-texture-blit → immersion-style → layout) — the immersive-present integration is the architectural
+frontier; each requirement was found one device cycle at a time. The IOSurface/engine/Step-C half is
+fully proven; only the CompositorLayer present-surface configuration remains.

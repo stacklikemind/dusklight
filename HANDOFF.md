@@ -112,6 +112,23 @@ Recipes/IDs in memory: `visionos-build-recipe`, `visionos-device-signing`, `visi
 
 ## NEXT 3 STEPS (resume here)
 
+★ **TOP PRIORITY — root cause found 2026-06-01 (see `docs/stereo-spike-interop.md` §9.17):** the whole
+IOSurface/engine/Step-C pipeline is proven green on device (engine→import→blit→tracked anchor→present
+all logged), AND `.immersionStyle(.full)` now opens the immersive space — but a forced OPAQUE red/blue
+eye clear is STILL BLACK. So our per-frame render into the drawable isn't scanned out. **Root cause:
+LAYER LAYOUT mismatch.** Device gives a **layered** drawable (`texCount=1, viewCount=2`), the sim gave
+**dedicated** (`texCount=2`, the path that worked). The bare `CompositorLayer { }` defaults to layered;
+we render two separate single-slice passes, which the device won't display.
+**FIX FIRST:** in `DuskVisionApp.swift`, use `CompositorLayer(configuration:) { layerRenderer in … }`
+with a configuration whose `.layout = .dedicated` (+ set color/depth formats + foveation there) so the
+device uses the sim-proven per-view path. Keep `kForceEyeClearTest = true` (in `StereoPresent.mm`) for
+the first run — success = whole view fills red(L)/blue(R) — then set it `false` for the real frame.
+Fallback if dedicated fails: implement proper layered rendering (one pass,
+`renderPassDescriptor.renderTargetArrayLength = viewCount`, view-texture-map, rasterization rate map).
+Current installed device build still has `kForceEyeClearTest = true` (forces the clear; real blit bypassed).
+
+(Older, now-DONE notes below.)
+
 1. **DONE (2026-05-31 23:1x): diagnostics uncapped + engine heartbeat added; built/signed/installed.**
    All `StereoPresent.mm` diagnostics are now periodic (`< 5 || %300`) and on NSLog (device-visible):
    `engine_frame_begin #N` (the key heartbeat — proves the engine thread reaches `aurora_end_frame`),

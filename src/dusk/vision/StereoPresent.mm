@@ -271,6 +271,64 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
     return true;
   }
 
+  // ===================== DIAGNOSTIC BISECTION (toggle) =====================
+  // Black-on-device, but the whole pipeline logs success. This isolates "does the present/compositor
+  // path display ANYTHING on device" from "the content we hand it is invisible (black or alpha=0)".
+  // When true: clear each eye slice to a solid OPAQUE color (red=view0, blue=view1) via a render pass,
+  // bypassing the IOSurface entirely. If you SEE red/blue -> present+scene+per-eye mapping are good,
+  // bug is the captured content/alpha. If still black -> the present/scene path itself isn't showing.
+  // Set false to restore the real IOSurface eye blit.
+  // RESULT (2026-06-01, device): with .immersionStyle(.full) the immersive space DOES open, but the
+  // forced opaque red/blue clear is STILL BLACK -- so the bug is NOT content/alpha; our per-frame
+  // render into cp_drawable_get_color_texture isn't being scanned out. cp_drawable_get_color_texture
+  // is the correct destination (header-confirmed) and the traditional cp_drawable_encode_present path
+  // is right, so the prime remaining suspect is the LAYER LAYOUT / render-loop shape: device gives a
+  // layered drawable (texCount=1, viewCount=2) and likely expects one render pass with
+  // renderTargetArrayLength=viewCount (+ rasterization rate map / view-texture-map), not two separate
+  // single-slice clears, AND the CompositorLayer needs an explicit layout configuration (we use a bare
+  // `CompositorLayer { }`). Next: match Apple's canonical fully-immersive render loop exactly. See
+  // docs/stereo-spike-interop.md §9.17.
+  static constexpr bool kForceEyeClearTest = true;
+  if (kForceEyeClearTest) {
+    for (size_t d = 0; d < drawableCount; ++d) {
+      cp_drawable_t drawable = drawables[d];
+      const size_t viewCount = cp_drawable_get_view_count(drawable);
+      const size_t texCount = cp_drawable_get_texture_count(drawable);
+      for (size_t view = 0; view < viewCount; ++view) {
+        const size_t texIndex = (texCount >= viewCount) ? view : 0;
+        const NSUInteger slice = (texCount >= viewCount) ? 0 : (NSUInteger)view;
+        id<MTLTexture> dstTex = cp_drawable_get_color_texture(drawable, texIndex);
+        if (dstTex == nil) {
+          continue;
+        }
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = dstTex;
+        rp.colorAttachments[0].slice = slice;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rp.colorAttachments[0].clearColor =
+            (view == 0) ? MTLClearColorMake(1.0, 0.0, 0.0, 1.0)   // left eye: opaque red
+                        : MTLClearColorMake(0.0, 0.0, 1.0, 1.0);  // right eye: opaque blue
+        id<MTLRenderCommandEncoder> enc = [commandBuffer renderCommandEncoderWithDescriptor:rp];
+        enc.label = @"Dusk Eye Clear Test";
+        [enc endEncoding];
+      }
+    }
+    static unsigned long s_clearFrames = 0;
+    const unsigned long clearN = s_clearFrames++;
+    if (clearN < 5 || (clearN % 300) == 0) {
+      NSLog(@"[dusk::vision] FORCE-CLEAR test: red(L)/blue(R) into eyes (frame #%lu)", clearN);
+    }
+    for (size_t i = 0; i < drawableCount; ++i) {
+      attachDeviceAnchor(drawables[i]);
+      cp_drawable_encode_present(drawables[i], commandBuffer);
+    }
+    [commandBuffer commit];
+    cp_frame_end_submission(frame);
+    return true;
+  }
+  // ========================= END DIAGNOSTIC =========================
+
   id<MTLTexture> srcTex = g_eye.metalTexture(device);
 
   // Wait on the Dawn->IOSurface blit fence (from SharedEyeTexture::endAccess, engine thread) before

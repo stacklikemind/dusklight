@@ -118,6 +118,13 @@ struct DuskVisionApp: App {
             ImmersiveSpace(id: "DuskStereo") {
                 DuskCompositorContent()
             }
+            // REQUIRED for a CompositorLayer to actually composite into the view. Without an explicit
+            // immersion style the space defaults to .mixed, and our rendered drawables were never shown
+            // (even a forced opaque-red clear stayed invisible -- only the windowed LaunchView panel
+            // appeared). Apple's "fully immersive Metal" sample sets .full here. Hide the rendered
+            // hands/limbs since the game owns the whole view.
+            .immersionStyle(selection: .constant(.full), in: .full)
+            .upperLimbVisibility(.hidden)
         }
     }
 }
