@@ -73,17 +73,19 @@ struct DuskCompositorContent: CompositorContent {
 struct DuskVisionApp: App {
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
 
-    init() {
-        // Boot the engine as soon as the app process starts.
-        startEngineOnce()
-    }
-
     var body: some Scene {
         // visionOS apps need an initial windowed scene; this tiny window requests the immersive
         // space on appear and then effectively gets out of the way.
         WindowGroup {
             LaunchView()
                 .task {
+                    // Boot the engine only AFTER the app/scene is up. The engine runs on a background
+                    // thread but marshals its SDL/UIKit-bound init (SDL_INIT_VIDEO, window creation,
+                    // event pump) onto the main thread via GCD; that requires the UIApplication/scene
+                    // and a live main run loop to exist first. Starting it in App.init() was too early
+                    // (the UIApplication/scene was not ready and SDL video init aborted). .task runs on
+                    // the main actor once the scene appears -- the correct, late-enough kickoff point.
+                    startEngineOnce()
                     _ = await openImmersiveSpace(id: "DuskStereo")
                 }
         }
