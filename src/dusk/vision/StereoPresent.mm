@@ -257,6 +257,26 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
             (unsigned long)c0.sampleCount, (unsigned long)c0.textureType,
             cp_drawable_get_rasterization_rate_map_count(d0), (int)cp_drawable_get_state(d0));
     }
+    // ---- TRUE-STEREO FOUNDATION (observation only; the live path is still mono into both eyes) ----
+    // For each eye/view, read the data we'll feed into per-eye rendering: the device->view transform
+    // (the eye offset; IPD is baked in by Apple), the ready-made per-eye projection
+    // (cp_drawable_compute_projection, the non-deprecated replacement for cp_view_get_tangents), and
+    // the authoritative view->(texture,slice) map. These numbers drive the convergence/world-scale
+    // math for the two-pass render; logging them on-device first lets us design that math against real
+    // values. simd_float4x4 is column-major: columns[3].xyz is the eye position (meters); the projection
+    // asymmetry (off-axis convergence) shows up in columns[2].x / columns[2].y.
+    for (size_t v = 0; v < viewCount && v < 2; ++v) {
+      cp_view_t view = cp_drawable_get_view(d0, v);
+      const simd_float4x4 eyeXform = cp_view_get_transform(view);
+      const simd_float4x4 proj =
+          cp_drawable_compute_projection(d0, cp_axis_direction_convention_right_up_back, v);
+      const cp_view_texture_map_t tmap = cp_view_get_view_texture_map(view);
+      NSLog(@"[dusk::vision] view %zu eyeOffset=(%.4f,%.4f,%.4f)m tex=%zu slice=%zu "
+            @"projXX=%.4f projYY=%.4f skewX=%.4f skewY=%.4f",
+            v, eyeXform.columns[3].x, eyeXform.columns[3].y, eyeXform.columns[3].z,
+            cp_view_texture_map_get_texture_index(tmap), cp_view_texture_map_get_slice_index(tmap),
+            proj.columns[0].x, proj.columns[1].y, proj.columns[2].x, proj.columns[2].y);
+    }
   }
 
   id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
