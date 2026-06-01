@@ -1,167 +1,295 @@
-# HANDOFF — visionOS stereoscopic present (branch `visionos-stereo-depth`)
+# HANDOFF — visionOS True Per-Eye Stereo (Dusklight on Apple Vision Pro)
 
-_Last updated: 2026-05-31 ~23:00. This file is the quick-start for a fresh session. The full,
-blow-by-blow record is in [`docs/stereo-spike-interop.md`](docs/stereo-spike-interop.md) §9.10–§9.16 —
-read §9.16 first (it has the exact "resume here" steps)._
+_Last updated: 2026-06-01. Branch: `visionos-stereo-depth`._
 
-## TL;DR
+This supersedes the older black-screen handoff. Read top-to-bottom; §0 and §6–§7 are the
+"what do I do next" parts. Persistent context also lives in the auto-memory at
+`~/.claude/projects/-Users-dan-dev-dusklight/memory/` (esp. `visionos-device-anchor-required.md`,
+`visionos-device-signing.md`, `aurora-is-webgpu-dawn.md`, `dan-runs-device-pushes-himself.md`).
 
-Goal: render Dusklight into a true per-eye **stereoscopic** view on Apple Vision Pro via a
-CompositorServices `ImmersiveSpace`, fed by Aurora's rendered frame through a shared IOSurface
-(architecture: [`STEREO.md`](STEREO.md) §5; spike plan: `docs/stereo-spike-interop.md`).
+---
 
-**Where we are:** the whole CompositorServices + ARKit + IOSurface plumbing now works and is **stable
-on a real Vision Pro** (no crash, head-tracked). The mono-into-both-eyes game frame is **proven
-rendering on the visionOS simulator**. The ONE remaining device gap: the engine→IOSurface content
-pipeline doesn't engage on device yet (drawables present with a valid anchor but empty → black). True
-per-eye stereo (different image per eye) is future work after content shows.
+## 0. TL;DR / current status
 
-## What we accomplished (this session)
+**Goal:** genuine per-eye stereoscopic depth for Dusklight (native Twilight Princess port) on
+Apple Vision Pro, per `STEREO.md`. Render the 3D world twice (one projection per eye) and present
+through a CompositorServices `ImmersiveSpace`.
 
-Sim (visionOS 26.5 simulator) — **verified working, with a disc**:
-- Step C end-to-end: Aurora renders the game frame → blits into a shared IOSurface (its "stereo
-  capture target") → CompositorServices present loop blits that into both eyes → visible, head-locked.
-- Prelaunch "Select Disc" / title UI renders too (the capture follows the RmlUi-composited image, not
-  the bare game framebuffer).
+**What works (committed, on device):** the game renders **mono** in correct color in a **full
+ImmersiveSpace on the real AVP**. The months-long black screen and the magenta/color bug are solved
+and committed (see §2/§3).
 
-Device (Apple Vision Pro, visionOS 26.5) — **all of these device-only blockers fixed & verified**:
-1. Launch crash `cp_frame_end_submission` `BUG_IN_CLIENT` → use the visionOS-26 `cp_frame_query_drawables`
-   array API (the deprecated single `cp_frame_query_drawable` aborts on device).
-2. "Presenting a drawable without a device anchor" → must attach an ARKit head-pose **device anchor**
-   to every drawable (sim doesn't enforce this).
-3. "...can only be queried when the world tracking provider is running" → start the ARKit session on
-   the **main thread**; gate the query on `ar_data_provider_get_state == running`.
-4. Layered drawable (`texCount=1, viewCount=2`: one 2D-array color texture, slice == view) → blit the
-   eye into each slice (sim was dedicated-per-view; blitting only slice 0 left the right eye black).
-5. **★ The key fix:** keep ALL ARKit objects alive as process-lifetime statics (the config + the
-   `ar_data_providers_t` collection, not just session/provider). They were ARC-freed right after
-   `ar_session_run`, so the provider never reliably reached `running`. After the fix: provider reaches
-   `running` in ~0.3s, `device anchor tracked=1`, drawable-drop errors stop, **app stable, no crash.**
+**What's in progress (committed as a WIP checkpoint this session — see §5):** the true two-pass
+per-eye stereo ("Aurora command-list replay") + a mono fallback for 2D-UI screens. It compiles and
+runs, but is **NOT working in-game yet** — blocked by two issues (§6):
+1. The **game won't load on the AVP** — a JKR archive-heap panic on the DVD thread when mounting a
+   disc archive (almost certainly a corrupt/truncated disc on the device; possibly a visionOS heap
+   issue). This is NOT a stereo bug; it's the first time the game has actually tried to load on the
+   device.
+2. A **latent crash + wrong scaling in the replay**: `render_stereo_eye` runs the GX draw pipelines
+   (built for the **MSAA, surface-format** EFB) straight into a **single-sample BGRA8** eye texture
+   → pipeline/target mismatch that will abort the moment real geometry renders, and meanwhile the
+   geometry is mis-scaled (EFB viewport ≠ eye texture size). One rework fixes both (§7 step 2).
 
-## Key decisions / hard-won facts (don't re-litigate)
+**App state:** just uninstalled+reinstalled, so the container is fresh (no remembered disc) → it
+boots to the prelaunch UI and no longer auto-crashes.
 
-- **ARKit in C, not Swift.** Apple's fully-immersive Metal samples use the C ARKit API; the Swift
-  `WorldTrackingProvider` doesn't cleanly bridge to the C `ar_world_tracking_provider_t` the present
-  loop needs. We do ARKit in C and it works. (A Swift-managed refactor was considered and shelved.)
-- **Never gate `cp_drawable_encode_present`/`commit` on having an anchor.** After `query_drawables` +
-  `start_submission` you MUST present every drawable + commit before `end_submission`, else
-  `BUG_IN_CLIENT` crash on frame 1. Always present; the compositor itself harmlessly drops frames
-  whose anchor isn't tracked yet.
-- **A fabricated identity anchor is rejected** ("device anchor has invalid tracking") — only a real
-  *tracked* anchor counts. So content is gated on world tracking actually running (it now does).
-- **Threading:** Dawn device work (SharedEyeTexture import / Begin/EndAccess, set_stereo_capture_target)
-  must run on the **engine thread** (Dawn isn't thread-safe). The present loop (Metal blit, anchor
-  query — `AR_MT_UNSAFE`) runs on its own **present thread**. They share the eye via atomics + a fence.
-- **Test workflow:** world tracking only runs while the **headset is worn**; taking it off to read
-  Mac logs stops tracking. Read device logs via **Console.app** (select the AVP) — it shows os_log
-  mostly un-redacted; the `.ips` crash files only store the `"%s"` format. Our own diagnostics use
-  public ints so they aren't `<private>`.
-- **Sim auto-shuts-down** between tries; reboot with `xcrun simctl boot` + `bootstatus -b`.
+---
 
-## Files modified
+## 1. The goal & the chosen architecture (decisions)
 
-Dusk layer (superproject, branch `visionos-stereo-depth`):
-- `src/dusk/vision/StereoPresent.mm` — CompositorServices present loop: `cp_frame_query_drawables`,
-  layered-aware eye blit, ARKit world-tracking start (main thread) + per-drawable device-anchor query,
-  engine-thread hooks `stereo_engine_frame_begin/end`, the cross-thread eye/IOSurface state, diagnostics.
-- `src/dusk/vision/StereoEngine.h` — **new**; plain-C++ engine-thread hook decls (no ObjC), included by
-  `m_Do_main.cpp`.
-- `src/dusk/vision/StereoBridge.{h,mm}` — `SharedEyeTexture` (IOSurface↔Dawn import, MTLSharedEvent
-  fence) + thread-safe `latestEndAccessFence`.
-- `src/dusk/vision/StereoPresent.h` — signatures (dropped the eye param; loop uses module-global eye).
-- `src/dusk/vision/DuskVisionApp.swift` — SwiftUI `@main`: opens the `DuskStereo` ImmersiveSpace, logs
-  the result; `dismissWindow` currently DISABLED (kept the launch window so the app stays foreground —
-  re-enable once content shows).
-- `src/m_Do/m_Do_main.cpp` — brackets both `aurora_end_frame()` call sites (launchUILoop + main01) with
-  `dusk::vision::stereo_engine_frame_begin()/_end()`, guarded `#if TARGET_OS_VISION`.
-- `CMakeLists.txt` — `if (VISIONOS)` block: link `-framework ARKit` (+ Metal/IOSurface/CompositorServices).
-- `platforms/visionos/Info.plist.in` — `UIApplicationSupportsMultipleScenes=true` (needed to open the
-  ImmersiveSpace alongside the window).
-- `docs/stereo-spike-interop.md` — full session log (§9.10–§9.16).
+Per `STEREO.md`: Aurora is WebGPU/Dawn (not native Metal), so Apple's single-pass vertex
+amplification and layered render targets are unreachable. The realistic path is **render the scene
+twice** into two IOSurface-backed eye textures and present them ourselves via a SwiftUI
+`ImmersiveSpace` + `CompositorLayer`. The IOSurface↔Dawn↔Metal interop spike is **done and proven**
+(that's the committed mono pipeline).
 
-Aurora submodule (`extern/aurora`, branch `visionos-stereo-depth`, HEAD `c61e9c1`; superproject
-pin updated by this checkpoint):
-- `lib/webgpu/gpu.{cpp,hpp}` — `set_stereo_capture_target` / `has_stereo_capture_target` /
-  `record_stereo_capture_blit` + shared-texture (IOSurface/MTLSharedEvent) device-feature request.
-- `lib/aurora.cpp` — `end_frame` blits the **composited present source** (RmlUi output when present,
-  else the resolved game frame) into the stereo capture target, so menus aren't black.
-- (Earlier on-branch: `lib/window.cpp` SDL main-thread init — committed previously.)
+**Decision — how to render the second eye (the crux):** an Aurora investigation (two sub-agents)
+established that Aurora records the whole frame's draws into a replayable command list
+(`g_renderPasses[*].commands`). We chose **Aurora command-list replay** over driving the game's
+render twice:
+- The game renders **once** (mono) into the EFB; at `end_frame` Aurora **re-encodes the recorded GX
+  draws a second time per eye** into two eye targets, with a per-eye projection patch.
+- Rejected "game-loop double render" because `fapGm_Execute()` runs game logic+render together (can't
+  call twice) and re-running the decomp draw risks state side-effects.
+- **No WGSL shader change** (other platforms share the shaders) — the per-eye difference is patched
+  into the projection bytes in a per-eye **copy** of the uniform buffer.
 
-NOT committed intentionally: `.claude/` (local settings); the throwaway vendored-SDL build patches
-under `build/<preset>/_deps/` (see CLAUDE.md "Throwaway SDL patches" — re-apply after a clean configure).
-
-## Build / sign / install / run
-
-Device (`build/visionos-default`):
-```sh
-cmake --build build/visionos-default
-codesign --force --generate-entitlement-der \
-  --sign FF90CB4DBFB4B583ACD140487A599825BFFB09AF \
-  --entitlements /tmp/dusk_ent.plist build/visionos-default/Dusklight.app   # ent plist: see memory visionos-device-signing
-codesign --verify --strict build/visionos-default/Dusklight.app
-xcrun devicectl device install app --device 6303AA5D-AE95-5D40-BAEE-B2E8C4AFEC3E build/visionos-default/Dusklight.app
-# Launch from the HEADSET Home View (devicectl process launch stalls on visionOS). Keep headset ON.
-# Read logs in Console.app -> select "Apple Vision Pro von Daniel" -> filter "dusk::vision".
+**Decision — the per-eye projection math (verified):** Aurora `Mat4x4` is row-major
+(`out.pos = vec4f(mv_pos,1) * proj`), so `clip.x = dot(mv,m0)`, `clip.w = dot(mv,m3)`. A per-eye
+clip-space x-shift `clip.x += A*clip.w + B` gives correct depth-dependent parallax for perspective
+draws **and** parks orthographic (HUD) content on a fixed plane automatically. Baked into proj as,
+per **perspective** draw (proj is 64 bytes; m0.x at +0, m0.z at +8, m0.w at +12):
 ```
-Sim (`build/visionos-sim-default`, UDID `B8CDFBCF-99D5-421F-A15E-6C82BC29BFB4`): `cmake --build`, then
-`xcrun simctl install` + `launch ... --dvd <ABSOLUTE host path to rom.iso>` (relative paths fail
-validation). Disc already at the sim app's `Documents/rom.iso`. Foreground with `open -a Simulator`.
+m0.z -= convergence;            // A term  (zero-parallax plane)
+m0.w += -eyeSep * m0.x;         // B term  (eye separation / parallax; scales with the draw's focal)
+```
+**Orthographic draws are left unpatched** (HUD/2D stays screen-fixed). Eye separation/convergence
+are in **game units** (TP world scale ≠ meters) → on-device tuning knobs (§7 step 3). Left eye gets
+`-eyeSep`, right `+eyeSep`; flip if depth is inverted.
 
-Recipes/IDs in memory: `visionos-build-recipe`, `visionos-device-signing`, `visionos-device-anchor-required`,
-`visionos-sdl-swift-workaround`.
+**Decision — 2D UI:** the GX replay only covers 3D geometry; Dusk's RmlUi/ImGui (disc-select, menus,
+console) are NOT in the GX list, so a UI-only frame would be black. Added a **mono fallback**: when a
+frame has 0 GX draws, blit the normal composite into both eyes (flat, visible). In-game Dusk UI
+overlays are still missing in stereo — a later "composite UI as a flat layer" follow-up.
 
-## NEXT 3 STEPS (resume here)
+**Decision — foundation-first** (user's choice) then wire the double-render. Done in that order.
 
-★ **TOP PRIORITY — root cause found 2026-06-01 (see `docs/stereo-spike-interop.md` §9.17):** the whole
-IOSurface/engine/Step-C pipeline is proven green on device (engine→import→blit→tracked anchor→present
-all logged), AND `.immersionStyle(.full)` now opens the immersive space — but a forced OPAQUE red/blue
-eye clear is STILL BLACK. So our per-frame render into the drawable isn't scanned out. **Root cause:
-LAYER LAYOUT mismatch.** Device gives a **layered** drawable (`texCount=1, viewCount=2`), the sim gave
-**dedicated** (`texCount=2`, the path that worked). The bare `CompositorLayer { }` defaults to layered;
-we render two separate single-slice passes, which the device won't display.
-**FIX FIRST:** in `DuskVisionApp.swift`, use `CompositorLayer(configuration:) { layerRenderer in … }`
-with a configuration whose `.layout = .dedicated` (+ set color/depth formats + foveation there) so the
-device uses the sim-proven per-view path. Keep `kForceEyeClearTest = true` (in `StereoPresent.mm`) for
-the first run — success = whole view fills red(L)/blue(R) — then set it `false` for the real frame.
-Fallback if dedicated fails: implement proper layered rendering (one pass,
-`renderPassDescriptor.renderTargetArrayLength = viewCount`, view-texture-map, rasterization rate map).
-Current installed device build still has `kForceEyeClearTest = true` (forces the clear; real blit bypassed).
+---
 
-(Older, now-DONE notes below.)
+## 2. What works & is committed (the milestone)
 
-1. **DONE (2026-05-31 23:1x): diagnostics uncapped + engine heartbeat added; built/signed/installed.**
-   All `StereoPresent.mm` diagnostics are now periodic (`< 5 || %300`) and on NSLog (device-visible):
-   `engine_frame_begin #N` (the key heartbeat — proves the engine thread reaches `aurora_end_frame`),
-   `device anchor tracked=N`, `drawables=… eyeReady=N`, `blitted eye …`. Engine import logs
-   `engine imported … ARMED` / `engine FAILED to import`. **AWAITING a headset-on device run + Console
-   capture** to read these. Interpreting the next capture (filter `dusk::vision`):
-   - **No `engine_frame_begin #…` at all** → the engine background thread isn't running its frame loop
-     on device (the real bug). Then trace: does `dusk_vision_run_engine`→`aurora_main`→`game_main`
-     reach `launchUILoop`/`main01`? Suspect the `dispatch_sync(main)` in `ensureWorldTracking`
-     deadlocking/contending with the engine's own marshal-to-main SDL init.
-   - **`engine_frame_begin` present but `pendingSurface=0` forever** → the present thread never
-     published the IOSurface (look for `published …x… eye IOSurface`); check the present loop reached
-     the publish path (needs a drawable with non-zero color tex).
-   - **`pendingSurface=1` but `engineInit=0` / `engine FAILED to import`** → `SharedEyeTexture::init`
-     (Dawn `ImportSharedTextureMemory`) fails on device → investigate that.
-   - **`eyeReady=1` + `blitted eye …` but still black** → content IS flowing; problem is elsewhere
-     (e.g. the captured frame itself empty, or sRGB/format). Different bug than expected.
-2. **Find why the engine never feeds the eye on device.** Last device run showed `eyeReady=0` and no
-   `blitted eye` line for 18 s, while the sim reaches `eyeReady=1` fast. So `stereo_engine_frame_begin`
-   isn't importing the published IOSurface on device. Check: is the engine background thread actually
-   running its frame loop on device (does it reach `launchUILoop` / `aurora_end_frame`)? Prime suspect:
-   the `dispatch_sync(main)` added to `ensureWorldTracking` interacting with the engine's own
-   marshal-to-main SDL init (a main-thread ordering/contention issue). Confirm the present thread
-   published `g_pendingIOSurface`, then confirm the engine thread picks it up.
-3. **Once eye content flows:** re-enable `dismissWindow(id: kLaunchWindowID)` in `DuskVisionApp.swift`
-   (remove the "keep window" workaround) so the launch panel doesn't float in front; verify the title
-   screen / game shows head-locked in the headset. Then begin true per-eye stereo: per-eye proj·view
-   matrix injection + two-pass render + off-axis frusta + head pose at `presentationTime`
-   (`STEREO.md` §5.1; current present is mono-into-both-eyes, identity pose).
+On `visionos-stereo-depth`:
+- `847baa1d21` — real game frame visible in immersive space on device (the depth + color + layout
+  config fixes). **This is the working mono milestone.**
+- `d7e21a086f` — per-eye view/projection foundation logging (observation only).
+- earlier: `229bf6857f`, `c27a70a777`, `d27ff4f9f2` (device-stable present checkpoints).
+- aurora submodule was committed at `c61e9c1` (composited-capture-source fix); the WIP checkpoint
+  (§5) adds a commit on top of it.
 
-## Caveats still open
-- App backgrounds/world-tracking pauses if the headset comes off (expected). Present loop should also
-  pause GPU submits when the layer state isn't `running` (saw "GPU work from background" when backgrounded).
-- Eye IOSurface is single-buffered (possible cross-frame read/write tearing once content streams).
-- This is Dan's **private fork**; the upstream "no AI-authored code" rule is waived here (memory
-  `dusklight-fork-ai-code-ok`). Would still apply if upstreaming.
+---
+
+## 3. Root causes already solved (do NOT re-debug — also in memory)
+
+- **★ Black screen on device = the drawable's DEPTH texture must be written+stored every frame.**
+  visionOS reprojects using depth; the device blanks a frame whose depth wasn't produced (the
+  simulator is lenient). Fix: attach `cp_drawable_get_depth_texture` with `loadAction=Clear,
+  storeAction=Store`. This was THE black-screen cause; layout (dedicated vs layered) was a red herring.
+- **Color/magenta = format mismatch.** The drawable defaulted to `RGBA16Float`; the BGRA8 capture
+  IOSurface blitted into it cross-format → magenta + channel fringing. Fix: `configuration.colorFormat
+  = .bgra8Unorm` (the AVP only offered `.bgra8Unorm_srgb` = rawValue 81; the unorm→srgb copy is valid
+  and gamma-correct).
+- Device-only CompositorServices strictnesses (all sim-lenient): device anchor per drawable,
+  `.immersionStyle(.full)`, `cp_frame_query_drawables` array API, frame-timing handshake. See
+  `visionos-device-anchor-required.md`.
+- Swift API: conform to `CompositorLayerConfiguration` (NOT `_CompositorLayerConfiguration`);
+  `makeConfiguration(capabilities:configuration:)`; `configuration.layout/.isFoveationEnabled/
+  .colorUsage`; `capabilities.supportedLayouts/supportedColorFormats(options:)`.
+
+**Real on-device numbers (from the foundation logging):** per-eye IPD offset ≈ ±0.0307 m;
+off-axis skew ±0.268; eye color texture **1888×1792**, BGRA8Unorm_srgb (fmt 81), single-sample, no
+foveation rate maps; the game's recorded render viewport is **2389×1792** (≠ the eye → the scaling
+mismatch).
+
+---
+
+## 4. How the in-progress stereo path is wired (read with §5)
+
+Engine thread (Dusk, `StereoPresent.mm`): publishes **two** IOSurfaces (L/R), imports them as Dawn
+textures (`SharedEyeTexture g_eye[2]`), and each frame calls
+`aurora::webgpu::set_stereo_eye_targets(leftView, rightView, w, h, eyeSepL, convL, eyeSepR, convR)`
+bracketed by per-eye `BeginAccess`/`EndAccess` around `aurora_end_frame()`.
+
+Aurora `end_frame`/`render`:
+- `upload_stereo_eye_uniforms` (common.cpp): scans `g_renderPasses` to set `g_stereoFrameHadGx`;
+  then (if eye targets armed) copies the frame's uniform bytes into two scratch buffers, patches each
+  **perspective** GX draw's proj per eye (the clip-shift math, using `DrawData.projOffset`/`projOrtho`
+  recorded in `command_processor.cpp`/`shader_info.cpp`), and uploads to `g_uniformBufferEye[2]`.
+  **Runs before the staging buffer is unmapped** (the CPU bytes must still be live).
+- `render`: if `has_stereo_eye_targets() && g_stereoFrameHadGx`, calls `render_stereo_eye(cmd,
+  eyeView, eye)` for each eye **before `g_renderPasses.clear()`**. It replays the recorded commands
+  into the eye color view (+ a throwaway offscreen depth), binding `g_uniformBindGroupEye[eye]` for
+  GX draws via an eye-aware `gx::render` overload.
+- `aurora.cpp` end_frame: **mono fallback** — if `has_stereo_eye_targets() && !stereo_frame_had_gx()`,
+  blit `*stereoCaptureSource` into both eye views via `record_stereo_capture_blit_into`.
+
+Present thread (`StereoPresent.mm`): waits on each eye's fence, blits `g_eye[0]`→view0,
+`g_eye[1]`→view1 (left/right decided from `cp_view_get_transform` x sign via `logicalEyeForView`),
+clears the drawable depth, presents.
+
+**Tunables (top of `StereoPresent.mm`):** `kStereoEyeSep = 4.0f` (game units — pure guess),
+`kStereoConvergence = 0.0f`.
+
+---
+
+## 5. Files touched this session + what changed
+
+**Committed (Dusk, `847baa1d21` / `d7e21a086f`):**
+- `src/dusk/vision/DuskVisionApp.swift` — `DuskLayerConfiguration: CompositorLayerConfiguration`
+  (dedicated layout if supported, foveation off, `.renderTarget` color usage, `bgra8Unorm` color
+  format); opens `ImmersiveSpace` with `.immersionStyle(.full)`.
+- `src/dusk/vision/StereoPresent.mm` — depth clear+store in the present, command-buffer status
+  diagnostics, per-eye foundation logging.
+
+**WIP — committed this session as the WIP checkpoint (both the main repo and the aurora submodule):**
+- `src/dusk/vision/StereoPresent.mm` — two eye IOSurfaces (`g_eye[2]`), per-eye blit,
+  `set_stereo_eye_targets` call, `kStereoEyeSep`/`kStereoConvergence`, `logicalEyeForView`.
+- `extern/aurora/lib/gx/pipeline.hpp` — `DrawData.projOffset` + `projOrtho`; eye-aware `gx::render` decl.
+- `extern/aurora/lib/gx/pipeline.cpp` — `render_impl(...)` + eye-aware `gx::render` overload (swaps bind group 1).
+- `extern/aurora/lib/gx/shader_info.{hpp,cpp}` — `build_uniform` records proj's byte offset (`outProjRel`).
+- `extern/aurora/lib/gx/command_processor.cpp` — populate `projOffset`/`projOrtho` (uses `g_gxState.projType`).
+- `extern/aurora/lib/gfx/common.{cpp,hpp}` — `g_uniformBufferEye[2]`/`g_uniformBindGroupEye[2]`,
+  `g_stereoFrameHadGx`+`stereo_frame_had_gx()`, `upload_stereo_eye_uniforms`, `render_stereo_eye`,
+  the per-eye replay gate in `render()`, the `stereo replay:` os_log diagnostic.
+- `extern/aurora/lib/webgpu/gpu.{cpp,hpp}` — `set_stereo_eye_targets`/`has_stereo_eye_targets` +
+  `StereoEyeTargets g_stereoEyeTargets`; `record_stereo_capture_blit_into` (+ `record_stereo_capture_blit`
+  delegates to it). `set_stereo_capture_target` (mono) kept, now dormant.
+- `extern/aurora/lib/aurora.cpp` — mono-fallback blit into both eyes when no GX.
+- `extern/aurora/tests/gx_test_stubs.cpp` — stub `build_uniform` signature updated.
+
+**Never commit `.claude/`** (untracked, intentional). The aurora submodule changes are committed
+inside the submodule — do NOT `git submodule update` expecting it to no-op; the main repo points at
+the new aurora WIP commit.
+
+---
+
+## 6. The two blockers (why in-game stereo isn't visible yet)
+
+1. **Disc-load crash (BLOCKS reaching the game at all).** Crash report
+   `/tmp/dusk_crashes/Dusklight-2026-06-01-121826.ips`: thread = **DVD thread**, `SIGABRT`,
+   `abort()` from `aurora::Module::fatal`/`OSPanic` ← `JKRExpHeap::do_alloc` ←
+   `JKRArchive::initFileDataPointers` ← `JKRDvdArchive::open` ← `mDoDvdThd_mountXArchive_c::execute`.
+   I.e. a JKR archive heap ran out while mounting a disc archive. **Leading hypothesis: the disc
+   image on the device is truncated/corrupt** (user said the prior one corrupted; the device tunnel
+   has been flaky — installs needed retries). Alt hypothesis: visionOS heap-sizing issue (heaps in
+   `src/m_Do/m_Do_machine.cpp:794-813` look like standard decomp sizes, not obviously mis-gated).
+   Disambiguate by loading the same `rom.iso` in **desktop** Dusklight (`--dvd`). The local image
+   `/Users/dan/dev/dusklight/rom.iso` is verified good (`GZ2E01` = TP USA, valid GC magic, 1048721408 B).
+
+2. **Replay format/MSAA mismatch + scaling (BLOCKS the replay once geometry renders).** The EFB
+   (`g_frameBuffer`) is created at `g_graphicsConfig.surfaceConfiguration.format` and **multisampled**
+   (`create_render_texture(...,true)`, `gpu.cpp`). The recorded GX pipelines are therefore baked for
+   (MSAA sampleCount, surface format). `render_stereo_eye` currently renders them directly into the
+   **single-sample BGRA8** eye IOSurface → render-pipeline/render-pass incompatibility → Metal abort
+   (only triggers when there ARE GX draws, i.e. in-game). Separately, it replays the recorded
+   **EFB-space viewport** (2389×1792) into the 1888×1792 eye → mis-scaled/cropped (the "scaling and
+   alignment is wrong" the user saw on the canvas).
+
+---
+
+## 7. NEXT STEPS (ordered)
+
+**Step 1 — get a valid disc on the device.** Confirm `rom.iso` loads in desktop Dusklight
+(`--dvd /Users/dan/dev/dusklight/rom.iso`). If it boots there, the device copy is the problem →
+re-push and verify the on-device size matches 1048721408 bytes. Push command (**Dan runs this
+himself** — see `dan-runs-device-pushes-himself.md`):
+```
+xcrun devicectl device copy to --device 6303AA5D-AE95-5D40-BAEE-B2E8C4AFEC3E \
+  --domain-type appDataContainer --domain-identifier dev.twilitrealm.dusk \
+  --source /Users/dan/dev/dusklight/rom.iso --destination Documents/rom.iso
+```
+If desktop also crashes loading, the `.iso` is bad. If it's neither (good image, good transfer) →
+investigate the visionOS JKR heap sizing / total app-memory budget (separate sub-project).
+
+**Step 2 — rework `render_stereo_eye` (fixes blocker #2: the latent crash AND the scaling).** Don't
+render GX draws straight into the BGRA8 eye texture. Instead render each eye the way the mono path
+renders the frame: into an **EFB-format, MSAA, EFB-size** color target (so the GX pipelines match) +
+resolve, then **resample-fit** that into the eye IOSurface (BGRA8, eye size) — reuse the existing
+resample/`record_stereo_capture_blit_into` path which already converts format + can letterbox-fit
+(AURORA_VIEWPORT_FIT, 64:27). Concretely: per eye, clear+replay into an EFB-equivalent target with
+the per-eye-patched uniforms, resolve, then resample into `g_stereoEyeTargets.view[eye]`. This makes
+the eye image match what the mono capture produced (correct format/scale) but with per-eye geometry.
+
+**Step 3 — tune stereo on device.** With the game loading and the replay valid, dial `kStereoEyeSep`
+(start 4.0; raise/lower for comfortable depth), set `kStereoConvergence`, and flip the L/R eyeSep
+sign if depth feels inverted. Verify with the `stereo replay: gxDraws=<large>` log (non-zero in-game).
+
+**Step 4 — follow-ups (after stereo looks right):**
+- In-game Dusk UI overlay (RmlUi/ImGui) missing in stereo — composite it as a flat layer over both eyes.
+- **CPU-wake watchdog**: the present/engine loops spin too hot; the OS killed the app at ~52s
+  (`caught waking the CPU 45001 times`). Add real frame pacing.
+- **Mid-frame teardown crash**: `cp_frame_end_submission` BUG IN CLIENT when the layer is
+  invalidated/headset-off mid-frame — bail cleanly on layer-state change.
+- Trim memory: `g_uniformBufferEye[2]` are 24 MB each (48 MB) + two ~13.5 MB IOSurfaces; shrink the
+  eye uniform buffers to the used size.
+- Remove the verbose per-frame diagnostics; squash the WIP; eventually open a PR (this private fork
+  allows AI-authored code — `dusklight-fork-ai-code-ok.md`).
+
+---
+
+## 8. Build / sign / install / run recipe
+
+Verified IDs (`visionos-device-signing.md`): device `6303AA5D-AE95-5D40-BAEE-B2E8C4AFEC3E`, bundle
+`dev.twilitrealm.dusk`, signing cert SHA1 `FF90CB4DBFB4B583ACD140487A599825BFFB09AF`
+(Apple Development: Daniel Walter), entitlements at `/tmp/dusk_ent.plist` (recreate if /tmp cleared —
+`application-identifier=39CTS9UG74.dev.twilitrealm.dusk`, `team-identifier=39CTS9UG74`,
+`get-task-allow=true`, `keychain-access-groups=[39CTS9UG74.dev.twilitrealm.dusk, com.apple.token]`).
+The `embedded.mobileprovision` already inside `build/visionos-default/Dusklight.app` survives rebuilds.
+
+```
+# Build (do NOT reconfigure — it would wipe the throwaway SDL patches under build/.../_deps;
+# see visionos-build-recipe.md / visionos-sdl-swift-workaround.md). Already configured.
+cmake --build /Users/dan/dev/dusklight/build/visionos-default
+# (real errors = grep 'error:' minus the benign "DAWN Werror: OFF" line)
+
+APP=/Users/dan/dev/dusklight/build/visionos-default/Dusklight.app
+codesign --force --generate-entitlement-der --sign FF90CB4DBFB4B583ACD140487A599825BFFB09AF \
+  --entitlements /tmp/dusk_ent.plist "$APP"
+codesign --verify --deep --strict "$APP"
+xcrun devicectl device install app --device 6303AA5D-AE95-5D40-BAEE-B2E8C4AFEC3E "$APP"   # retry on tunnel blips
+```
+**Launch from the headset Home View** (`devicectl ... process launch` STALLS on visionOS). World
+tracking needs the headset worn + foregrounded. To clear a bad disc / reset: `devicectl device
+uninstall app ... dev.twilitrealm.dusk` then reinstall (wipes the container).
+
+---
+
+## 9. Diagnostics (all via Console.app with the AVP selected; logs use NSLog/os_log = device-visible)
+
+Filter `dusk::vision`. Key lines and meaning:
+- `stereo replay: passes=N gxDraws=M eyeTarget=WxH firstVP=(x,y,wxh)` — `gxDraws=0` ⇒ 2D-UI-only
+  frame (mono fallback, expected); `gxDraws>0` ⇒ in-game (the replay runs). `firstVP` vs `eyeTarget`
+  shows the scaling mismatch.
+- `view N eyeOffset=(x,y,z)m … projXX/projYY/skewX/skewY` — per-eye data from `cp_view`.
+- `cmdbuf #N status=4 error=none` — the present command buffer executed (4=Completed).
+- `engine imported two … eye textures; TRUE stereo ARMED (eyeSep=… conv=…)`, `blitted L+R eyes …`.
+
+Pull a device crash log (no root needed; device must be UNLOCKED):
+```
+xcrun devicectl device copy from --device 6303AA5D-AE95-5D40-BAEE-B2E8C4AFEC3E \
+  --domain-type systemCrashLogs --source <Name-YYYY-MM-DD-HHMMSS.ips> --destination /tmp/x.ips
+# or --source . --destination /tmp/dusk_crashes/ to pull the whole dir, then find the newest Dusklight-*.ips
+```
+`.ips` is two JSON objects (header line + body); parse `faultingThread` + `threads[ft].frames` with
+`usedImages` for names. `log collect --device-udid` needs root (sudo).
+
+---
+
+## 10. References
+- `STEREO.md` — the design doc (architecture, injection points, perf).
+- `docs/stereo-spike-interop.md` — the long device-debug log.
+- Memory: `visionos-device-anchor-required.md` (★ depth + device strictnesses + Swift API + color
+  format), `visionos-device-signing.md`, `visionos-build-recipe.md`, `visionos-sdl-swift-workaround.md`,
+  `aurora-is-webgpu-dawn.md`, `dusklight-fork-ai-code-ok.md`, `dan-runs-device-pushes-himself.md`.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)

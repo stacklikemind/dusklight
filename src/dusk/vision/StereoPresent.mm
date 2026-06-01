@@ -109,31 +109,48 @@ bool attachDeviceAnchor(cp_drawable_t drawable) {
 
 // -----------------------------------------------------------------------------------------------
 // Cross-thread Step-C state. The CompositorServices present thread sizes + allocates the shared
-// IOSurface (it alone knows the drawable's per-eye texture dimensions); the engine thread imports it
-// into Dawn and drives the per-frame shared-texture access. Ownership of each field by thread:
-//   - g_eye:               Dawn side (init/begin/endAccess) ONLY on the engine thread; Metal side
+// IOSurfaces (it alone knows the drawable's per-eye texture dimensions); the engine thread imports
+// them into Dawn and drives the per-frame shared-texture access. Ownership of each field by thread:
+//   - g_eye[]:             Dawn side (init/begin/endAccess) ONLY on the engine thread; Metal side
 //                          (metalTexture / latestEndAccessFence) ONLY on the present thread. The two
 //                          sides touch disjoint members except the lock-guarded fence fields.
-//   - g_pendingIOSurface:  written once by the present thread, consumed once by the engine thread.
-//   - g_eyeReady:          engine -> present handshake; release/acquire publishes the imported eye.
+//   - g_pendingIOSurface[]: written once by the present thread, consumed once by the engine thread.
+//   - g_eyeReady:          engine -> present handshake; release/acquire publishes the imported eyes.
+//
+// TRUE PER-EYE STEREO: two eyes (index 0 = LEFT logical eye, 1 = RIGHT). Aurora re-renders the
+// recorded frame twice, patching the projection per eye, into g_eye[0]/g_eye[1]'s IOSurfaces; the
+// present loop blits each into the matching physical drawable view (left/right decided from the
+// per-view eye-offset sign). Both eye IOSurfaces are the same size (the per-eye color texture size).
 // -----------------------------------------------------------------------------------------------
-SharedEyeTexture g_eye;
-std::atomic<IOSurfaceRef> g_pendingIOSurface{nullptr};
+constexpr int kEyeCount = 2;  // [0] = left, [1] = right
+SharedEyeTexture g_eye[kEyeCount];
+std::atomic<IOSurfaceRef> g_pendingIOSurface[kEyeCount]{{nullptr}, {nullptr}};
 std::atomic<uint32_t> g_pendingWidth{0};
 std::atomic<uint32_t> g_pendingHeight{0};
 std::atomic<bool> g_eyeReady{false};
 
 // Engine-thread-only bookkeeping for the frame-begin/end bracket.
 bool g_engineInitDone = false;
-bool g_didBeginThisFrame = false;
+bool g_didBeginThisFrame[kEyeCount]{false, false};
+
+// ---- TRUE-STEREO TUNABLES (adjust these; tuned on device) -------------------------------------
+// kStereoEyeSep: horizontal eye separation / parallax in TP world units. The per-eye projection
+// shift is B = -eyeSep * focalX, applied as +eyeSep to the right eye and -eyeSep to the left eye.
+// TP's world scale is unknown a priori, so this is THE knob: larger = more pronounced depth (and
+// eye strain); 0 = mono. Flip the sign mapping below if depth feels inverted (near/far swapped).
+// kStereoConvergence: off-axis convergence shift (m0.z -= convergence); 0 = convergence at infinity.
+// Start near 0 and raise slightly to pull the zero-parallax plane closer.
+static constexpr float kStereoEyeSep = 4.0f;       // game units; on-device tuning knob
+static constexpr float kStereoConvergence = 0.0f;  // start at 0
 }  // namespace
 
-// Publish (once) an IOSurface sized to the compositor drawable's per-eye color texture so the engine
-// thread can import it as Aurora's stereo capture target. Returns true once a surface is published
-// (now or earlier). Present-thread only.
+// Publish (once) TWO IOSurfaces (left + right), each sized to the compositor drawable's per-eye color
+// texture, so the engine thread can import them as Aurora's per-eye stereo render targets. Returns
+// true once both surfaces are published (now or earlier). Present-thread only.
 static bool publishEyeSurfaceIfNeeded(cp_drawable_t drawable) noexcept {
-  if (g_pendingIOSurface.load(std::memory_order_acquire) != nullptr) {
-    return true;  // Already published; engine will import it.
+  if (g_pendingIOSurface[0].load(std::memory_order_acquire) != nullptr &&
+      g_pendingIOSurface[1].load(std::memory_order_acquire) != nullptr) {
+    return true;  // Already published; engine will import them.
   }
   id<MTLTexture> dst0 = cp_drawable_get_color_texture(drawable, 0);
   if (dst0 == nil || dst0.width == 0 || dst0.height == 0) {
@@ -141,18 +158,43 @@ static bool publishEyeSurfaceIfNeeded(cp_drawable_t drawable) noexcept {
   }
   const uint32_t w = static_cast<uint32_t>(dst0.width);
   const uint32_t h = static_cast<uint32_t>(dst0.height);
-  IOSurfaceRef surface = createBGRA8IOSurface(w, h);
-  if (surface == nullptr) {
+  IOSurfaceRef left = createBGRA8IOSurface(w, h);
+  IOSurfaceRef right = createBGRA8IOSurface(w, h);
+  if (left == nullptr || right == nullptr) {
+    if (left != nullptr) {
+      CFRelease(left);
+    }
+    if (right != nullptr) {
+      CFRelease(right);
+    }
     return false;
   }
   g_pendingWidth.store(w, std::memory_order_relaxed);
   g_pendingHeight.store(h, std::memory_order_relaxed);
-  // Hand the +1-retained surface to the engine thread (release-publish). The engine's
-  // SharedEyeTexture::init CFRetains it; our +1 is intentionally leaked for the process-lifetime
-  // scaffold rather than racing a CFRelease against the import.
-  g_pendingIOSurface.store(surface, std::memory_order_release);
-  NSLog(@"[dusk::vision] published %ux%u eye IOSurface for engine import", w, h);
+  // Hand the +1-retained surfaces to the engine thread (release-publish). The engine's
+  // SharedEyeTexture::init CFRetains them; our +1 is intentionally leaked for the process-lifetime
+  // scaffold rather than racing a CFRelease against the import. Publish right first so that once the
+  // engine observes a non-null left[0] (its loop predicate), both are already visible.
+  g_pendingIOSurface[1].store(right, std::memory_order_release);
+  g_pendingIOSurface[0].store(left, std::memory_order_release);
+  NSLog(@"[dusk::vision] published two %ux%u eye IOSurfaces (L+R) for engine import", w, h);
   return true;
+}
+
+// Map a physical drawable view to a logical eye index (0 = left, 1 = right) from the view's eye
+// offset along x (cp_view_get_transform columns[3].x; left eye is the negative-x offset). Falls back
+// to using the view index itself if the offset is ~0 (e.g. a single-view drawable). Present-thread.
+static int logicalEyeForView(cp_drawable_t drawable, size_t viewIndex) noexcept {
+  cp_view_t view = cp_drawable_get_view(drawable, viewIndex);
+  const simd_float4x4 xform = cp_view_get_transform(view);
+  const float offsetX = xform.columns[3].x;
+  if (offsetX < -1e-5f) {
+    return 0;  // left
+  }
+  if (offsetX > 1e-5f) {
+    return 1;  // right
+  }
+  return static_cast<int>(viewIndex & 1);  // degenerate: fall back to view index
 }
 
 bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
@@ -391,16 +433,20 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
   }
   // ========================= END DIAGNOSTIC =========================
 
-  id<MTLTexture> srcTex = g_eye.metalTexture(device);
+  // Per-eye source textures: g_eye[0] = left, g_eye[1] = right (Aurora rendered each with a per-eye
+  // projection shift). Both alias the IOSurfaces published earlier.
+  id<MTLTexture> eyeTex[kEyeCount] = {g_eye[0].metalTexture(device), g_eye[1].metalTexture(device)};
 
-  // Wait on the Dawn->IOSurface blit fence (from SharedEyeTexture::endAccess, engine thread) before
-  // reading the eye texture, so we don't sample a half-written frame. Event + value are fetched
-  // together under a lock so we never wait on a value the event won't reach. One wait per command
-  // buffer covers every drawable/view blitted below.
-  id<MTLSharedEvent> eyeEvent = nil;
-  uint64_t eyeValue = 0;
-  if (g_eye.latestEndAccessFence(&eyeEvent, &eyeValue) && eyeEvent != nil) {
-    [commandBuffer encodeWaitForEvent:eyeEvent value:eyeValue];
+  // Wait on each eye's Dawn->IOSurface blit fence (from SharedEyeTexture::endAccess, engine thread)
+  // before reading that eye texture, so we don't sample a half-written frame. Event + value are
+  // fetched together under a lock so we never wait on a value the event won't reach. One wait per
+  // eye per command buffer covers every drawable/view blitted below.
+  for (int eye = 0; eye < kEyeCount; ++eye) {
+    id<MTLSharedEvent> eyeEvent = nil;
+    uint64_t eyeValue = 0;
+    if (g_eye[eye].latestEndAccessFence(&eyeEvent, &eyeValue) && eyeEvent != nil) {
+      [commandBuffer encodeWaitForEvent:eyeEvent value:eyeValue];
+    }
   }
   // TODO(stereo): if no fence was exported, fall back to a coarse sync -- e.g. ensure the producing
   // Dawn submission has completed on the CPU before this point.
@@ -430,7 +476,7 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
     }
   }
 
-  if (srcTex != nil) {
+  if (eyeTex[0] != nil && eyeTex[1] != nil) {
     id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
     blit.label = @"Dusk Stereo Eye Blit";
     for (size_t d = 0; d < drawableCount; ++d) {
@@ -440,17 +486,21 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
       for (size_t view = 0; view < viewCount; ++view) {
         // Two layouts: DEDICATED (texCount == viewCount) -> one texture per view, slice 0; LAYERED
         // (texCount == 1, viewCount > 1, as on the real device) -> a single 2D-array color texture
-        // whose slice index IS the view index. Blitting only slice 0 (the old code) left the right
-        // eye black on device. Map view -> (texture, slice) for both cases.
+        // whose slice index IS the view index. Map view -> (texture, slice) for both cases.
         const size_t texIndex = (texCount >= viewCount) ? view : 0;
         const NSUInteger slice = (texCount >= viewCount) ? 0 : (NSUInteger)view;
         id<MTLTexture> dstTex = cp_drawable_get_color_texture(drawable, texIndex);
         if (dstTex == nil) {
           continue;
         }
-        // Scaffold: blit the same (mono) eye texture into every eye view. Clamp the copy to the
+        // TRUE STEREO: pick the eye source matching this physical view (left/right from the view's
+        // eye-offset sign), so each eye gets its own per-eye-projected image. Clamp the copy to the
         // overlapping region so mismatched sizes don't trap.
-        // TODO(stereo): render/import a distinct texture per eye for true stereo separation.
+        const int eye = logicalEyeForView(drawable, view);
+        id<MTLTexture> srcTex = eyeTex[eye];
+        if (srcTex == nil) {
+          continue;
+        }
         const NSUInteger w = MIN(srcTex.width, dstTex.width);
         const NSUInteger h = MIN(srcTex.height, dstTex.height);
         [blit copyFromTexture:srcTex
@@ -468,8 +518,8 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
     static unsigned long s_blitFrames = 0;
     const unsigned long blitN = s_blitFrames++;
     if (blitN < 5 || (blitN % 300) == 0) {
-      NSLog(@"[dusk::vision] blitted eye %lux%lu into drawable views (frame #%lu)",
-            (unsigned long)srcTex.width, (unsigned long)srcTex.height, blitN);
+      NSLog(@"[dusk::vision] blitted L+R eyes (%lux%lu) into drawable views (frame #%lu)",
+            (unsigned long)eyeTex[0].width, (unsigned long)eyeTex[0].height, blitN);
     }
   } else {
     static unsigned long s_noTexFrames = 0;
@@ -520,38 +570,51 @@ void stereo_engine_frame_begin() noexcept {
   const unsigned long engN = s_engineFrames++;
   if (engN < 5 || (engN % 300) == 0) {
     NSLog(@"[dusk::vision] engine_frame_begin #%lu: pendingSurface=%d engineInit=%d eyeReady=%d", engN,
-          g_pendingIOSurface.load(std::memory_order_acquire) != nullptr ? 1 : 0,
+          g_pendingIOSurface[0].load(std::memory_order_acquire) != nullptr ? 1 : 0,
           g_engineInitDone ? 1 : 0, g_eyeReady.load(std::memory_order_acquire) ? 1 : 0);
   }
   if (!g_engineInitDone) {
-    IOSurfaceRef surface = g_pendingIOSurface.load(std::memory_order_acquire);
-    if (surface != nullptr) {
+    IOSurfaceRef left = g_pendingIOSurface[0].load(std::memory_order_acquire);
+    IOSurfaceRef right = g_pendingIOSurface[1].load(std::memory_order_acquire);
+    if (left != nullptr && right != nullptr) {
       const uint32_t w = g_pendingWidth.load(std::memory_order_relaxed);
       const uint32_t h = g_pendingHeight.load(std::memory_order_relaxed);
-      if (g_eye.init(surface, w, h)) {
-        // Arm Aurora's capture target AND publish readiness on the same (engine) thread that records
-        // the blit, so has_stereo_capture_target() and our BeginAccess can never disagree mid-frame.
-        aurora::webgpu::set_stereo_capture_target(g_eye.view(), w, h);
+      if (g_eye[0].init(left, w, h) && g_eye[1].init(right, w, h)) {
+        // Arm Aurora's TRUE per-eye stereo targets AND publish readiness on the same (engine) thread
+        // that records the eye replays, so has_stereo_eye_targets() and our BeginAccess can never
+        // disagree mid-frame. Sign convention: left eye gets -kStereoEyeSep, right gets +kStereoEyeSep
+        // (flip if depth feels inverted). Aurora applies B = -eyeSep * focalX as a per-draw clip.x
+        // shift, leaving orthographic (HUD/2D) draws untouched.
+        aurora::webgpu::set_stereo_eye_targets(g_eye[0].view(), g_eye[1].view(), w, h,
+                                               /*eyeSepLeft=*/-kStereoEyeSep, kStereoConvergence,
+                                               /*eyeSepRight=*/+kStereoEyeSep, kStereoConvergence);
         g_engineInitDone = true;
         g_eyeReady.store(true, std::memory_order_release);
-        NSLog(@"[dusk::vision] engine imported %ux%u eye texture; stereo capture ARMED", w, h);
+        NSLog(@"[dusk::vision] engine imported two %ux%u eye textures; TRUE stereo ARMED (eyeSep=%.2f conv=%.2f)",
+              w, h, (double)kStereoEyeSep, (double)kStereoConvergence);
       } else {
-        // Import failed: drop the pending surface so we don't retry every frame, and leave the
-        // capture target unset (the engine keeps presenting mono to its flat surface).
-        g_pendingIOSurface.store(nullptr, std::memory_order_release);
-        NSLog(@"[dusk::vision] engine FAILED to import eye texture; stereo capture disabled");
+        // Import failed: drop the pending surfaces so we don't retry every frame, and leave the eye
+        // targets unset (the engine keeps presenting mono to its flat surface).
+        g_pendingIOSurface[0].store(nullptr, std::memory_order_release);
+        g_pendingIOSurface[1].store(nullptr, std::memory_order_release);
+        NSLog(@"[dusk::vision] engine FAILED to import eye textures; stereo disabled");
       }
     }
   }
-  // Open shared-texture access for this frame. Must precede aurora_end_frame(), which records and
-  // submits the capture blit that uses the shared texture.
-  g_didBeginThisFrame = g_engineInitDone && g_eye.beginAccess();
+  // Open shared-texture access for both eyes this frame. Must precede aurora_end_frame(), which
+  // records and submits the per-eye replays that write the shared textures.
+  if (g_engineInitDone) {
+    g_didBeginThisFrame[0] = g_eye[0].beginAccess();
+    g_didBeginThisFrame[1] = g_eye[1].beginAccess();
+  }
 }
 
 void stereo_engine_frame_end() noexcept {
-  if (g_didBeginThisFrame) {
-    g_eye.endAccess();  // Exports the GPU-completion fence the present loop waits on.
-    g_didBeginThisFrame = false;
+  for (int eye = 0; eye < kEyeCount; ++eye) {
+    if (g_didBeginThisFrame[eye]) {
+      g_eye[eye].endAccess();  // Exports the GPU-completion fence the present loop waits on.
+      g_didBeginThisFrame[eye] = false;
+    }
   }
 }
 
