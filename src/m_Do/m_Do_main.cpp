@@ -287,6 +287,15 @@ void main01(void) {
 
         dusk::ui::update();
 
+#if defined(__APPLE__) && defined(TARGET_OS_VISION) && TARGET_OS_VISION
+        // Mirror the stereo presentation mode into the present thread (which can't read settings).
+        dusk::vision::stereo_set_world_locked(dusk::getSettings().game.visionWorldLockedScreen.getValue());
+        // Latch this frame's head pose (the present thread's latest tracked anchor) BEFORE the game's
+        // camera/draw runs, so head-look and the drawable's device anchor agree -> the compositor
+        // reprojects head motion to the live display pose (smooth 90Hz). No-op until a tracked anchor.
+        dusk::vision::stereo_engine_latch_head_pose();
+#endif
+
         const auto pacing = dusk::game_clock::advance_main_loop();
         if (pacing.is_interpolating) {
             if (pacing.sim_ticks_to_run > 0) {
@@ -623,15 +632,6 @@ int game_main(int argc, char* argv[]) {
     // visionOS pins a fixed 64:27 (21:9) content frame (see updateRenderSize()),
     // so Aurora must always letterbox/pillarbox it into the real display.
     AuroraSetViewportPolicy(AURORA_VIEWPORT_FIT);
-    // Head-look is applied in the camera path, which updates at the ~30Hz sim rate -- on the 90Hz
-    // display that reads as stepping during head motion. Frame interpolation drives the
-    // presentation-camera path (where head-look is also applied) at a higher rate, smoothing it. Enable
-    // it when head-look is on (overriding a default/persisted Off; Capped to avoid spinning the render
-    // loop into the CPU-wake watchdog). Turn off game.visionHeadLook to opt out.
-    if (dusk::getSettings().game.visionHeadLook.getValue() &&
-        dusk::getSettings().game.enableFrameInterpolation.getValue() == dusk::FrameInterpMode::Off) {
-        dusk::getSettings().game.enableFrameInterpolation.setValue(dusk::FrameInterpMode::Capped);
-    }
 #else
     if (dusk::getSettings().video.lockAspectRatio) {
         AuroraSetViewportPolicy(AURORA_VIEWPORT_FIT);

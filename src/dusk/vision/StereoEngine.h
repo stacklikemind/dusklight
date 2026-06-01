@@ -26,6 +26,18 @@ namespace dusk::vision {
 // (SharedEyeTexture::init) and arms Aurora's stereo capture target so end_frame blits the resolved
 // frame into the shared eye texture. Then, every frame the target is armed, it opens shared-texture
 // access (BeginAccess) so the blit Aurora records is valid. No-op until a surface is published.
+// Call at FRAME START (before the game's camera/draw runs for the frame). Snapshots the present
+// thread's latest tracked head anchor as this frame's render pose and feeds it to the head-look camera
+// hook, so the rendered camera and the drawable's device anchor use the same pose -- letting the
+// compositor reproject head motion to the live display pose (smooth 90Hz head-look). No-op until a
+// tracked anchor exists / off visionOS.
+void stereo_engine_latch_head_pose() noexcept;
+
+// Engine thread: mirror game.visionWorldLockedScreen into the present thread (which can't read settings).
+// true = world-locked screen (a quad fixed in the room, compositor-reprojected); false = legacy
+// face-locked panel (eyes blitted fullscreen). Call each frame from the game loop. Default true.
+void stereo_set_world_locked(bool worldLocked) noexcept;
+
 void stereo_engine_frame_begin() noexcept;
 
 // Call immediately AFTER aurora_end_frame(). Closes shared-texture access (EndAccess), which exports

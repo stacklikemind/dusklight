@@ -105,8 +105,15 @@ UserSettings g_userSettings = {
         },
         .swapDirectSelect {"game.swapDirectSelect", false},
 
-        // visionOS
-        .visionHeadLook {"game.visionHeadLook", true},
+        // visionOS. Default OFF: the visionOS stereo present now world-locks the screen (the compositor
+        // reprojects a fixed in-room screen from the live head pose at 90Hz), which supersedes driving
+        // TP's 30Hz camera from the head -- that "fought" the face-locked panel. See StereoPresent.mm.
+        .visionHeadLook {"game.visionHeadLook", false},
+        // visionOS stereo presentation: true = world-locked screen (a quad fixed in your room, compositor-
+        // reprojected -- comfortable, no camera-fighting); false = legacy face-locked panel (eyes blitted
+        // fullscreen, glued to your view -- more immersive, pairs with visionHeadLook). Switch by flipping
+        // this default and rebuilding. See src/dusk/vision/StereoPresent.mm.
+        .visionWorldLockedScreen {"game.visionWorldLockedScreen", true},
 
         // Cheats
         .infiniteHearts {"game.infiniteHearts", false},
@@ -296,6 +303,7 @@ void registerSettings() {
     Register(g_userSettings.game.gyroInvertYaw);
     Register(g_userSettings.game.freeCamera);
     Register(g_userSettings.game.visionHeadLook);
+    Register(g_userSettings.game.visionWorldLockedScreen);
     Register(g_userSettings.game.debugFlyCam);
     Register(g_userSettings.game.debugFlyCamLockEvents);
     Register(g_userSettings.game.allowBackgroundInput);

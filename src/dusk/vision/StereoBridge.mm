@@ -193,8 +193,14 @@ id<MTLTexture> SharedEyeTexture::metalTexture(id<MTLDevice> device) noexcept {
   if (m_metalTexture != nullptr) {
     return (__bridge id<MTLTexture>)m_metalTexture;
   }
+  // sRGB view of the IOSurface bytes. The game writes sRGB-encoded color; the compositor drawable is
+  // bgra8Unorm_srgb. The old fullscreen BLIT copied raw bytes (no conversion), so a non-sRGB view worked.
+  // The world-locked quad SAMPLES this texture and writes to the sRGB drawable, which sRGB-encodes on
+  // write -- so we must sRGB-DECODE on sample, or the color double-encodes and washes out. An sRGB view
+  // makes the sampler decode; the decode/encode then round-trips to the original bytes. (Raw blits still
+  // copy bytes verbatim regardless of this format, so the face-locked path is unaffected.)
   MTLTextureDescriptor* desc =
-      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB
                                                          width:m_width
                                                         height:m_height
                                                      mipmapped:NO];

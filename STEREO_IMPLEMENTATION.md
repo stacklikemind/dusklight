@@ -4,9 +4,56 @@ How Dusklight renders genuine **per-eye stereoscopic 3D** of *Twilight Princess*
 end to end: the architecture, the render pipeline, every file/function that matters, and *why* each
 piece exists. Companion to `STEREO.md` (the original design doc) and `HANDOFF.md` (build/run state).
 
-> Status: per-eye stereo renders and **fuses** on real AVP hardware. Panel convergence is solved;
-> the depth-amount (`kStereoEyeSep`) is in final on-device tuning. visionOS-only — every change is
-> guarded so other platforms are byte-for-byte unaffected.
+> Status: per-eye stereo renders and **fuses** on real AVP hardware. The **default presentation is now a
+> world-locked screen** (comfortable, no camera-fighting); the original **face-locked panel** and an
+> optional **head-look** (head drives TP's camera) are preserved as alternate, build-selected modes. See
+> "Presentation modes" immediately below. visionOS-only — every change is guarded so other platforms are
+> byte-for-byte unaffected.
+
+---
+
+## Presentation modes & how to build each (READ FIRST)
+
+After the per-eye stereo first fused, the port gained a second presentation and a head-look experiment.
+There are now **two presentation modes** (plus a head-look sub-option), selected by config. Switching is
+**build-time**: change the default in `src/dusk/settings.cpp` and rebuild — there is no on-device toggle
+(by design). The engine reads the config and mirrors it to the present thread via
+`dusk::vision::stereo_set_world_locked()`, because `StereoPresent.mm` (ARC, no game PCH) cannot include
+`settings.h` (it would pull `dolphin/types.h`'s `bool` typedef + `global.h` constants into the TU).
+
+| Mode | `visionWorldLockedScreen` | `visionHeadLook` | What you get |
+|------|---------------------------|------------------|--------------|
+| **World-locked screen** *(default)* | `true` | `false` | Stereo frame on a screen **fixed in your room**, compositor-reprojected from your live head pose at 90 Hz. Comfortable; TP's camera untouched. You look *at/around* a floating screen. (§10) |
+| **Face-locked panel** | `false` | `false` | Legacy panel: the stereo frame **fills your view**, glued to your head — bigger, more immersive. |
+| **Face-locked + head-look** | `false` | `true` | As above, but your head **drives TP's camera** (look around *in* the game). ⚠ Motion fighting — see §11. |
+
+**Why a world-locked default?** Driving TP's **30 Hz** game camera from the head under a **90 Hz**
+face-locked panel produced a tug-of-war ("fighting") that no camera math fixed — it is architectural
+(§11). The world-locked screen sidesteps it (leave the camera alone; let the compositor do the head
+tracking), so it is the default. The face-locked path is preserved for immersion/experimentation.
+
+### Building each mode
+
+Full configure/sign/install/disc-push recipe and device IDs: `HANDOFF.md` §8 and `CLAUDE.md` (Apple
+Vision section). **Do not reconfigure** CMake — it wipes the throwaway SDL patches; just `cmake --build`.
+
+1. **World-locked screen (default)** — build as-is:
+   ```sh
+   cmake --build build/visionos-default        # device  (build/visionos-sim-default for the simulator)
+   ```
+2. **Face-locked panel** — set the screen default `false`, **and** restore the panel-convergence slide
+   (it is `0` for the world-locked quad, but the face-locked panel needs it to fuse — §4b), then build:
+   ```cpp
+   // src/dusk/settings.cpp
+   .visionWorldLockedScreen {"game.visionWorldLockedScreen", false},
+   // src/dusk/vision/StereoPresent.mm   (~0.25 fused on device; 0 is correct only for world-locked)
+   static constexpr float kStereoConvergence = 0.25f;
+   ```
+3. **Face-locked + head-look** — additionally enable head-look:
+   ```cpp
+   // src/dusk/settings.cpp
+   .visionHeadLook {"game.visionHeadLook", true},
+   ```
 
 ---
 
@@ -174,6 +221,12 @@ different world angles per eye, giving the flat panel a **large built-in dispari
 giveaway that a *constant* convergence knob was the missing piece. Sliding the panels oppositely
 (≈0.25 NDC per eye) cancels the asymmetry and the panel fuses.
 
+> **Mode-dependent.** The ≈0.25 slide is for the **face-locked panel** only. In the **world-locked
+> screen** (§10, the default) each eye already gets its correct view of the quad via the real per-eye
+> transform/projection, so the constant slide is *wrong* there (it pushes the images ~50% apart and edge
+> content falls outside one eye). `kStereoConvergence` is therefore **`0`** by default; set it back to
+> ≈`0.25f` only when building the face-locked panel.
+
 ---
 
 ## 5. Files changed — Dusk layer (`src/dusk/vision/`, `src/m_Do/`, platform)
@@ -272,7 +325,58 @@ These cost the most time and are the reason "it worked in the sim" wasn't enough
 
 ---
 
-## 10. Known limitations / next steps
+## 10. World-locked screen mode (the default)
+
+Instead of blitting the eye textures fullscreen (a panel glued to your face), this mode draws each eye's
+texture onto a **quad fixed in the room**. Each eye renders that quad through its real CompositorServices
+transform + projection, so the screen stays put as you move/turn; the compositor reprojects it from the
+live head pose at 90 Hz. Result: a stable floating screen — comfortable, and TP's camera is untouched.
+
+Implemented inline in `presentStereoFrame` (the default branch). **Per-eye MVP**:
+
+```
+MVP = projection · inverse(originFromDevice · eyeTransform) · panelModel
+```
+
+- `projection = cp_drawable_compute_projection(drawable, right_up_back, viewIndex)`.
+- `eyeTransform = cp_view_get_transform(view)` is eye→device, so `inverse(originFromDevice · eyeTransform)`
+  is the world→eye view matrix — Apple's documented CompositorServices pattern.
+- `originFromDevice = ar_device_anchor_get_origin_from_anchor_transform(<this frame's tracked anchor>)`,
+  queried once per frame (`currentFramePose`).
+- `panelModel` places a unit quad at `kPanelDistance` (2 m) ahead of the **recenter pose** (the first
+  tracked head pose), **leveled to gravity** (world up, so a head tilt at anchor time doesn't cant the
+  screen), facing the user, scaled to `kPanelHalfW` × `kPanelHalfH` (64:27).
+
+The quad **writes depth** (depth-stencil state, write enabled) — this drives the compositor's reprojection
+*and* satisfies the device "write depth or scan out black" rule (§9). Color is the eye texture sampled and
+written to the sRGB drawable (see the sRGB gotcha in §9). The legacy fullscreen blit is preserved as
+`renderFaceLockedPanel()` and selected when `visionWorldLockedScreen` is false.
+
+**Tunables** (`StereoPresent.mm`): `kPanelDistance`, `kPanelHalfW`, `kPanelHalfH`. The screen anchors
+where you face when it first appears (no recenter button yet — a controller-bound recenter is a possible
+follow-up). Panel convergence (§4b) must be **0** here: the quad already gives each eye its correct view,
+so a constant per-eye slide just breaks fusion / pushes edge content out of one eye.
+
+## 11. Head-look — and why it is off by default
+
+Head-look (`src/dusk/vision/HeadLook.{h,cpp}`, gated on `game.visionHeadLook`) feeds the AVP head pose
+into TP's camera so your head turns the in-game view. It composes onto the view matrix at the camera
+chokepoints (`d_camera.cpp::camera_draw` and `frame_interpolation.cpp::begin_presentation_camera`) using
+the **full relative head-view matrix** — `inverse(rel)` mapped directly, since TP's view space matches
+ARKit's right-handed X-right/Y-up/Z-back convention (per `mDoMtx_lookAt`), so it is correct at *any* head
+orientation (an earlier yaw/pitch decomposition reversed past ~90°). It is 6DoF (rotation + translation)
+and suppressed during cutscenes / Z-lock-on.
+
+**It is disabled by default** because on the **face-locked** panel it "fights": TP's camera updates at
+~30 Hz while the panel tracks your head at 90 Hz, so the panel follows your head instantly while the
+content swings a frame behind → a tug-of-war that feels like the world shoving back on every movement.
+This is **architectural**, not a tuning bug — it survived 3DoF→6DoF, the yaw/pitch→full-matrix rewrite, a
+base-camera freeze, and compositor reprojection (each "fixed" one symptom and surfaced another). The
+world-locked screen (§10) is the real fix: don't move the game camera at all; let the compositor do the
+head tracking. Head-look is kept for the face-locked mode and experimentation — enable with
+`visionWorldLockedScreen=false` **and** `visionHeadLook=true`, then rebuild.
+
+## 12. Known limitations / next steps
 
 - **Depth amount** (`kStereoEyeSep`) still being finalized; likely also wants a **disparity clamp** so
   near objects can't diverge past fusion regardless of scene depth.

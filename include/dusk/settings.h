@@ -214,6 +214,7 @@ struct UserSettings {
 
         // visionOS
         ConfigVar<bool> visionHeadLook;
+        ConfigVar<bool> visionWorldLockedScreen;
 
         // Cheats
         ConfigVar<bool> infiniteHearts;

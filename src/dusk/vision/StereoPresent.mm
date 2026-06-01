@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 
 #include "dusk/vision/HeadLook.h"
 #include "dusk/vision/StereoEngine.h"
@@ -51,6 +52,17 @@ ar_session_t g_arSession = nil;
 ar_world_tracking_provider_t g_worldProvider = nil;
 ar_data_providers_t g_dataProviders = nil;
 ar_world_tracking_configuration_t g_worldConfig = nil;
+
+// Head-look smoothing via compositor reprojection. The present thread is the SOLE ARKit querier (the
+// query is AR_MT_UNSAFE) and stores its newest tracked anchor here. At each engine frame start,
+// stereo_engine_latch_head_pose() snapshots it as the RENDER anchor -- the pose this frame's head-look
+// is baked for -- and feeds its transform to the head-look hook, so camera and anchor agree. The present
+// then tags the drawable with the render anchor, so visionOS reprojects render-pose -> live display pose
+// (90Hz) and head motion looks smooth for BOTH eyes despite the ~30Hz render. g_anchorMutex guards both
+// (present writes latest / reads render; engine reads latest / writes render).
+std::mutex g_anchorMutex;
+ar_device_anchor_t g_latestQueriedAnchor = nil;  // newest tracked anchor (present-thread query)
+ar_device_anchor_t g_renderAnchor = nil;         // anchor the current frame's content was rendered for
 
 void ensureWorldTracking() {
   if (g_worldProvider != nil) {
@@ -94,23 +106,32 @@ bool attachDeviceAnchor(cp_drawable_t drawable) {
   cp_frame_timing_t timing = cp_drawable_get_frame_timing(drawable);
   const CFTimeInterval presentTime =
       cp_time_to_cf_time_interval(cp_frame_timing_get_presentation_time(timing));
-  ar_device_anchor_t anchor = ar_device_anchor_create();
-  const bool ok = ar_world_tracking_provider_query_device_anchor_at_timestamp(
-                      g_worldProvider, presentTime, anchor) == ar_device_anchor_query_status_success &&
-                  ar_device_anchor_is_tracked(anchor);
+  ar_device_anchor_t queried = ar_device_anchor_create();
+  const bool tracked = ar_world_tracking_provider_query_device_anchor_at_timestamp(
+                           g_worldProvider, presentTime, queried) ==
+                           ar_device_anchor_query_status_success &&
+                       ar_device_anchor_is_tracked(queried);
+  // Store the fresh query for the engine to latch this frame's head-look pose. Tag THIS drawable with
+  // the fresh PREDICTED-PRESENT pose so the compositor does MINIMAL reprojection of our head-locked
+  // panel. (Tagging with the older render pose made the compositor reproject head motion, which
+  // double-counted with the baked head-look -> "fighting"/oscillation and pitch-stretch while moving.
+  // The head-look composed into the game camera is the sole motion source.)
+  ar_device_anchor_t anchorToSet = nil;
+  {
+    std::lock_guard<std::mutex> lk(g_anchorMutex);
+    if (tracked) {
+      g_latestQueriedAnchor = queried;
+    }
+    anchorToSet = tracked ? queried : nil;
+  }
+  const bool ok = (anchorToSet != nil);
   if (ok) {
-    cp_drawable_set_device_anchor(drawable, anchor);
-    // Publish the head pose to the head-look camera hook (the engine thread reads it). Head-look only
-    // consumes it when the in-game setting is on; otherwise this is a cheap, unused store.
-    const simd_float4x4 headXform = ar_device_anchor_get_origin_from_anchor_transform(anchor);
-    float headMtx[16];
-    memcpy(headMtx, &headXform, sizeof(float) * 16);
-    dusk::vision::headlook::setHeadTransform(headMtx, true);
+    cp_drawable_set_device_anchor(drawable, anchorToSet);
   }
   static unsigned long s_anchorFrames = 0;
   const unsigned long anchorN = s_anchorFrames++;
   if (anchorN < 5 || (anchorN % 300) == 0) {
-    NSLog(@"[dusk::vision] device anchor tracked=%d (frame #%lu)", ok ? 1 : 0, anchorN);
+    NSLog(@"[dusk::vision] anchor set=%d tracked=%d (frame #%lu)", ok ? 1 : 0, tracked ? 1 : 0, anchorN);
   }
   return ok;
 }
@@ -149,17 +170,103 @@ bool g_didBeginThisFrame[kEyeCount]{false, false};
 // kStereoConvergence: off-axis convergence shift (m0.z -= convergence); 0 = convergence at infinity.
 // Start near 0 and raise slightly to pull the zero-parallax plane closer.
 static constexpr float kStereoEyeSep = 0.5f;        // game units; small -- even 1.0 strained on device
-// Per-eye NDC horizontal panel shift, applied OPPOSITE per eye (left +c, right -c) as a blit offset, to
-// converge the flat panel so it fuses. ~0.25 found on device (the AVP per-eye projection is strongly
-// off-axis, so a large shift is needed). This is the constant offset; eyeSep adds depth around it.
-static constexpr float kStereoConvergence = 0.25f;
+// Per-eye NDC horizontal panel shift, applied OPPOSITE per eye (left +c, right -c) as a blit offset.
+// ~0.25 was needed to fuse the FACE-LOCKED panel (a flat panel filling each eye). The WORLD-LOCKED quad
+// instead gives each eye its correct view of the screen via the real per-eye transform/projection, so
+// this constant slide is now WRONG -- it shoves the L/R images apart (~50% non-overlap at the edges, so
+// edge GUI falls outside one eye) and breaks fusion. Zeroed for the world-locked screen. (If the
+// face-locked path is restored as a mode, it sets its own convergence.)
+static constexpr float kStereoConvergence = 0.0f;
 
 // On-device tuning: when 1, ignore kStereoEyeSep/kStereoConvergence and instead run a tuning sweep in
 // stereo_engine_frame_begin() (a few seconds per stable step) so a value can be picked by eye in ONE run.
 // Currently sweeps PANEL CONVERGENCE (a per-eye horizontal slide) to fuse the flat panel; set back to 0
 // and bake the chosen value once dialed in. See stereo_engine_frame_begin().
 #define STEREO_EYESEP_SWEEP 0
+
+// ---- WORLD-LOCKED SCREEN (visionOS) -----------------------------------------------------------
+// The stereo eyes are drawn onto a quad FIXED in your room, not blitted fullscreen (= a panel glued to
+// your face). Each eye renders the quad through its real CompositorServices transform + projection, so
+// the screen stays put as you move/turn, and the compositor reprojects it at 90Hz from the live head
+// pose. Comfortable, and it leaves TP's 30Hz camera untouched -- which is what "fought" the face-locked
+// panel when the head drove the camera. Tune distance/size on device.
+constexpr float kPanelDistance = 2.0f;                        // meters in front of the recenter pose
+constexpr float kPanelHalfW = 1.3f;                           // half-width (meters) -> ~2.6m-wide screen
+constexpr float kPanelHalfH = kPanelHalfW * (27.0f / 64.0f);  // 64:27 (21:9), matching the game's AR
+id<MTLRenderPipelineState> g_panelPipeline = nil;             // present-thread only
+id<MTLDepthStencilState> g_panelDepthState = nil;
+simd_float4x4 g_panelAnchorPose;                              // recenter head pose; the panel is placed off it
+bool g_havePanelAnchor = false;
+// Presentation mode: true = world-locked quad (default), false = legacy face-locked blit. The engine
+// thread sets it from game.visionWorldLockedScreen (StereoPresent.mm can't include settings.h -- it pulls
+// dolphin/types.h's `bool` typedef + global.h constants into this ARC/no-PCH TU); the present thread reads.
+std::atomic<bool> g_worldLockedScreen{true};
 }  // namespace
+
+// Lazily build the textured-quad pipeline used to draw the world-locked screen. The attachment formats
+// must match the drawable's color/depth textures. Present-thread only; a no-op after the first build.
+static void ensurePanelPipeline(id<MTLDevice> device, MTLPixelFormat colorFmt,
+                                MTLPixelFormat depthFmt) noexcept {
+  if (g_panelPipeline != nil || device == nil) {
+    return;
+  }
+  NSError* err = nil;
+  NSString* src =
+      @"#include <metal_stdlib>\n"
+      @"using namespace metal;\n"
+      @"struct VSOut { float4 position [[position]]; float2 uv; };\n"
+      @"vertex VSOut dusk_panel_vs(uint vid [[vertex_id]], constant float4x4& mvp [[buffer(0)]]) {\n"
+      @"  const float2 p[4] = { float2(-1,-1), float2(1,-1), float2(-1,1), float2(1,1) };\n"
+      @"  const float2 t[4] = { float2(0,1), float2(1,1), float2(0,0), float2(1,0) };\n"
+      @"  VSOut o; o.position = mvp * float4(p[vid], 0.0, 1.0); o.uv = t[vid]; return o;\n"
+      @"}\n"
+      @"fragment float4 dusk_panel_fs(VSOut in [[stage_in]], texture2d<float> tex [[texture(0)]]) {\n"
+      @"  constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);\n"
+      @"  return tex.sample(s, in.uv);\n"
+      @"}\n";
+  id<MTLLibrary> lib = [device newLibraryWithSource:src options:nil error:&err];
+  if (lib == nil) {
+    NSLog(@"[dusk::vision] panel shader compile failed: %@", err);
+    return;
+  }
+  MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
+  pd.label = @"Dusk Panel";
+  pd.vertexFunction = [lib newFunctionWithName:@"dusk_panel_vs"];
+  pd.fragmentFunction = [lib newFunctionWithName:@"dusk_panel_fs"];
+  pd.colorAttachments[0].pixelFormat = colorFmt;
+  pd.depthAttachmentPixelFormat = depthFmt;
+  g_panelPipeline = [device newRenderPipelineStateWithDescriptor:pd error:&err];
+  if (g_panelPipeline == nil) {
+    NSLog(@"[dusk::vision] panel pipeline build failed: %@", err);
+    return;
+  }
+  MTLDepthStencilDescriptor* dd = [[MTLDepthStencilDescriptor alloc] init];
+  dd.depthCompareFunction = MTLCompareFunctionLessEqual;
+  dd.depthWriteEnabled = YES;
+  g_panelDepthState = [device newDepthStencilStateWithDescriptor:dd];
+  NSLog(@"[dusk::vision] world-locked panel pipeline ready (color=%lu depth=%lu)",
+        (unsigned long)colorFmt, (unsigned long)depthFmt);
+}
+
+// Query this frame's predicted head pose (origin_from_device) for positioning the world-locked quad.
+// Returns false until world tracking yields a tracked pose. Present-thread only.
+static bool currentFramePose(cp_drawable_t drawable, simd_float4x4* outPose) noexcept {
+  if (g_worldProvider == nil ||
+      ar_data_provider_get_state(g_worldProvider) != ar_data_provider_state_running) {
+    return false;
+  }
+  cp_frame_timing_t timing = cp_drawable_get_frame_timing(drawable);
+  const CFTimeInterval t = cp_time_to_cf_time_interval(cp_frame_timing_get_presentation_time(timing));
+  ar_device_anchor_t a = ar_device_anchor_create();
+  const bool tracked = ar_world_tracking_provider_query_device_anchor_at_timestamp(
+                           g_worldProvider, t, a) == ar_device_anchor_query_status_success &&
+                       ar_device_anchor_is_tracked(a);
+  if (!tracked) {
+    return false;
+  }
+  *outPose = ar_device_anchor_get_origin_from_anchor_transform(a);
+  return true;
+}
 
 // Publish (once) TWO IOSurfaces (left + right), each sized to the compositor drawable's per-eye color
 // texture, so the engine thread can import them as Aurora's per-eye stereo render targets. Returns
@@ -212,6 +319,75 @@ static int logicalEyeForView(cp_drawable_t drawable, size_t viewIndex) noexcept 
     return 1;  // right
   }
   return static_cast<int>(viewIndex & 1);  // degenerate: fall back to view index
+}
+
+// LEGACY face-locked panel (the path before the world-locked screen): blit each eye's texture FULLSCREEN
+// into the drawable, so the stereo image is glued to your view. More immersive / bigger FOV, and it pairs
+// with head-look; but driving TP's 30Hz camera under this 90Hz face-locked panel is what "fought" head
+// motion -- hence the world-locked default. Kept selectable via game.visionWorldLockedScreen. Depth has
+// no source here, so it is cleared+stored per view first (required on device or the compositor scans out
+// black). Present-thread only.
+static void renderFaceLockedPanel(id<MTLCommandBuffer> commandBuffer, cp_drawable_t* drawables,
+                                  size_t drawableCount, id<MTLTexture> __strong* eyeTex,
+                                  id<MTLDevice> device) noexcept {
+  (void)device;
+  for (size_t d = 0; d < drawableCount; ++d) {
+    cp_drawable_t drawable = drawables[d];
+    const size_t viewCount = cp_drawable_get_view_count(drawable);
+    const size_t texCount = cp_drawable_get_texture_count(drawable);
+    for (size_t view = 0; view < viewCount; ++view) {
+      const size_t texIndex = (texCount >= viewCount) ? view : 0;
+      const NSUInteger slice = (texCount >= viewCount) ? 0 : (NSUInteger)view;
+      id<MTLTexture> depthTex = cp_drawable_get_depth_texture(drawable, texIndex);
+      if (depthTex == nil) {
+        continue;
+      }
+      MTLRenderPassDescriptor* dp = [MTLRenderPassDescriptor renderPassDescriptor];
+      dp.depthAttachment.texture = depthTex;
+      dp.depthAttachment.slice = slice;
+      dp.depthAttachment.loadAction = MTLLoadActionClear;
+      dp.depthAttachment.storeAction = MTLStoreActionStore;
+      dp.depthAttachment.clearDepth = 1.0;
+      id<MTLRenderCommandEncoder> denc = [commandBuffer renderCommandEncoderWithDescriptor:dp];
+      [denc endEncoding];
+    }
+  }
+
+  if (eyeTex[0] == nil || eyeTex[1] == nil) {
+    return;
+  }
+  id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+  blit.label = @"Dusk Stereo Eye Blit";
+  for (size_t d = 0; d < drawableCount; ++d) {
+    cp_drawable_t drawable = drawables[d];
+    const size_t viewCount = cp_drawable_get_view_count(drawable);
+    const size_t texCount = cp_drawable_get_texture_count(drawable);
+    for (size_t view = 0; view < viewCount; ++view) {
+      const size_t texIndex = (texCount >= viewCount) ? view : 0;
+      const NSUInteger slice = (texCount >= viewCount) ? 0 : (NSUInteger)view;
+      id<MTLTexture> dstTex = cp_drawable_get_color_texture(drawable, texIndex);
+      if (dstTex == nil) {
+        continue;
+      }
+      const int eye = logicalEyeForView(drawable, view);
+      id<MTLTexture> srcTex = eyeTex[eye];
+      if (srcTex == nil) {
+        continue;
+      }
+      const NSUInteger w = MIN(srcTex.width, dstTex.width);
+      const NSUInteger h = MIN(srcTex.height, dstTex.height);
+      [blit copyFromTexture:srcTex
+                sourceSlice:0
+                sourceLevel:0
+               sourceOrigin:MTLOriginMake(0, 0, 0)
+                 sourceSize:MTLSizeMake(w, h, 1)
+                  toTexture:dstTex
+           destinationSlice:slice
+           destinationLevel:0
+          destinationOrigin:MTLOriginMake(0, 0, 0)];
+    }
+  }
+  [blit endEncoding];
 }
 
 bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
@@ -468,81 +644,121 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
   // TODO(stereo): if no fence was exported, fall back to a coarse sync -- e.g. ensure the producing
   // Dawn submission has completed on the CPU before this point.
 
-  // REQUIRED on device: write+store each eye's DEPTH texture or the compositor scans out BLACK (the
-  // simulator is lenient). The color comes from the blit below; depth has no source, so clear+store
-  // it via a depth-only render pass per eye. Different textures from the blit -> no ordering hazard.
+  // Presentation mode: world-locked screen (default; the quad-in-room block below) vs the legacy
+  // face-locked panel. Selected by config (flip the default + rebuild to switch). The face-locked path
+  // presents + returns here, so the world-locked block below remains the sole, untouched world-locked path.
+  if (!g_worldLockedScreen.load(std::memory_order_relaxed)) {
+    renderFaceLockedPanel(commandBuffer, drawables, drawableCount, eyeTex, device);
+    for (size_t i = 0; i < drawableCount; ++i) {
+      attachDeviceAnchor(drawables[i]);
+      cp_drawable_encode_present(drawables[i], commandBuffer);
+    }
+    [commandBuffer commit];
+    cp_frame_end_submission(frame);
+    return true;
+  }
+
+  // WORLD-LOCKED SCREEN: draw each eye's rendered frame onto a quad FIXED in the room (replacing the old
+  // fullscreen face-locked blit). Query this frame's head pose; the first tracked frame anchors the screen
+  // at the recenter pose. Per view, render the quad through that eye's transform + projection so it stays
+  // put as the head moves -- the compositor then reprojects render->display at 90Hz. We ALWAYS clear+store
+  // color and depth per view (depth is REQUIRED on device or the compositor scans out black; it also
+  // drives reprojection); the quad is drawn on top once a pose + eye textures + pipeline are ready.
+  simd_float4x4 originFromDevice = matrix_identity_float4x4;
+  const bool framePoseOk = currentFramePose(drawables[0], &originFromDevice);
+  if (framePoseOk && !g_havePanelAnchor) {
+    g_panelAnchorPose = originFromDevice;
+    g_havePanelAnchor = true;
+    NSLog(@"[dusk::vision] world-locked screen anchored at recenter pose");
+  }
+
+  // Panel model matrix (fixed in the world): centered kPanelDistance ahead of the recenter pose at eye
+  // height, LEVELED to gravity (world up) so a head tilt at recenter doesn't cant the screen, facing the
+  // user, scaled to the screen half-size. simd_float4x4 columns are basis vectors; column 3 is position.
+  simd_float4x4 panelModel = matrix_identity_float4x4;
+  if (g_havePanelAnchor) {
+    simd_float3 fwd = -simd_make_float3(g_panelAnchorPose.columns[2].x, g_panelAnchorPose.columns[2].y,
+                                        g_panelAnchorPose.columns[2].z);
+    fwd.y = 0.0f;
+    fwd = simd_normalize(fwd);
+    const simd_float3 worldUp = simd_make_float3(0.0f, 1.0f, 0.0f);
+    const simd_float3 normal = -fwd;  // panel faces back toward the user
+    const simd_float3 right = simd_normalize(simd_cross(worldUp, normal));
+    const simd_float3 up = simd_cross(normal, right);
+    const simd_float3 pos = simd_make_float3(g_panelAnchorPose.columns[3].x,
+                                             g_panelAnchorPose.columns[3].y,
+                                             g_panelAnchorPose.columns[3].z);
+    const simd_float3 center = pos + fwd * kPanelDistance;
+    panelModel.columns[0] = simd_make_float4(right * kPanelHalfW, 0.0f);
+    panelModel.columns[1] = simd_make_float4(up * kPanelHalfH, 0.0f);
+    panelModel.columns[2] = simd_make_float4(normal, 0.0f);
+    panelModel.columns[3] = simd_make_float4(center, 1.0f);
+  }
+
+  const bool drawPanel = (eyeTex[0] != nil && eyeTex[1] != nil && framePoseOk && g_havePanelAnchor);
   for (size_t d = 0; d < drawableCount; ++d) {
     cp_drawable_t drawable = drawables[d];
     const size_t viewCount = cp_drawable_get_view_count(drawable);
     const size_t texCount = cp_drawable_get_texture_count(drawable);
     for (size_t view = 0; view < viewCount; ++view) {
+      // DEDICATED layout (texCount == viewCount) -> one texture per view, slice 0; LAYERED (texCount == 1,
+      // the real device) -> one 2D-array texture whose slice IS the view index. Map view -> (tex, slice).
       const size_t texIndex = (texCount >= viewCount) ? view : 0;
       const NSUInteger slice = (texCount >= viewCount) ? 0 : (NSUInteger)view;
-      id<MTLTexture> depthTex = cp_drawable_get_depth_texture(drawable, texIndex);
-      if (depthTex == nil) {
+      id<MTLTexture> dstColor = cp_drawable_get_color_texture(drawable, texIndex);
+      id<MTLTexture> dstDepth = cp_drawable_get_depth_texture(drawable, texIndex);
+      if (dstColor == nil) {
         continue;
       }
-      MTLRenderPassDescriptor* dp = [MTLRenderPassDescriptor renderPassDescriptor];
-      dp.depthAttachment.texture = depthTex;
-      dp.depthAttachment.slice = slice;
-      dp.depthAttachment.loadAction = MTLLoadActionClear;
-      dp.depthAttachment.storeAction = MTLStoreActionStore;
-      dp.depthAttachment.clearDepth = 1.0;
-      id<MTLRenderCommandEncoder> denc = [commandBuffer renderCommandEncoderWithDescriptor:dp];
-      [denc endEncoding];
-    }
-  }
-
-  if (eyeTex[0] != nil && eyeTex[1] != nil) {
-    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
-    blit.label = @"Dusk Stereo Eye Blit";
-    for (size_t d = 0; d < drawableCount; ++d) {
-      cp_drawable_t drawable = drawables[d];
-      const size_t viewCount = cp_drawable_get_view_count(drawable);
-      const size_t texCount = cp_drawable_get_texture_count(drawable);
-      for (size_t view = 0; view < viewCount; ++view) {
-        // Two layouts: DEDICATED (texCount == viewCount) -> one texture per view, slice 0; LAYERED
-        // (texCount == 1, viewCount > 1, as on the real device) -> a single 2D-array color texture
-        // whose slice index IS the view index. Map view -> (texture, slice) for both cases.
-        const size_t texIndex = (texCount >= viewCount) ? view : 0;
-        const NSUInteger slice = (texCount >= viewCount) ? 0 : (NSUInteger)view;
-        id<MTLTexture> dstTex = cp_drawable_get_color_texture(drawable, texIndex);
-        if (dstTex == nil) {
-          continue;
-        }
-        // TRUE STEREO: pick the eye source matching this physical view (left/right from the view's
-        // eye-offset sign), so each eye gets its own per-eye-projected image. Clamp the copy to the
-        // overlapping region so mismatched sizes don't trap.
+      if (drawPanel && dstDepth != nil) {
+        ensurePanelPipeline(device, dstColor.pixelFormat, dstDepth.pixelFormat);
+      }
+      MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+      rp.colorAttachments[0].texture = dstColor;
+      rp.colorAttachments[0].slice = slice;
+      rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+      rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+      rp.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+      const bool haveDepth = (dstDepth != nil);
+      if (haveDepth) {
+        rp.depthAttachment.texture = dstDepth;
+        rp.depthAttachment.slice = slice;
+        rp.depthAttachment.loadAction = MTLLoadActionClear;
+        rp.depthAttachment.storeAction = MTLStoreActionStore;
+        rp.depthAttachment.clearDepth = 1.0;
+      }
+      id<MTLRenderCommandEncoder> enc = [commandBuffer renderCommandEncoderWithDescriptor:rp];
+      if (enc == nil) {
+        continue;
+      }
+      enc.label = @"Dusk World-Locked Panel";
+      if (drawPanel && haveDepth && g_panelPipeline != nil) {
         const int eye = logicalEyeForView(drawable, view);
         id<MTLTexture> srcTex = eyeTex[eye];
-        if (srcTex == nil) {
-          continue;
+        if (srcTex != nil) {
+          // MVP = projection * inverse(originFromDevice * eyeFromDevice) * model. cp_view_get_transform
+          // is eye->device; origin_from_anchor is device->world; so view = inverse(world<-device<-eye).
+          cp_view_t cview = cp_drawable_get_view(drawable, view);
+          const simd_float4x4 eyeXform = cp_view_get_transform(cview);
+          const simd_float4x4 proj = cp_drawable_compute_projection(
+              drawable, cp_axis_direction_convention_right_up_back, view);
+          const simd_float4x4 viewMat = simd_inverse(simd_mul(originFromDevice, eyeXform));
+          simd_float4x4 mvp = simd_mul(proj, simd_mul(viewMat, panelModel));
+          [enc setRenderPipelineState:g_panelPipeline];
+          [enc setDepthStencilState:g_panelDepthState];
+          [enc setVertexBytes:&mvp length:sizeof(mvp) atIndex:0];
+          [enc setFragmentTexture:srcTex atIndex:0];
+          [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         }
-        const NSUInteger w = MIN(srcTex.width, dstTex.width);
-        const NSUInteger h = MIN(srcTex.height, dstTex.height);
-        [blit copyFromTexture:srcTex
-                  sourceSlice:0
-                  sourceLevel:0
-                 sourceOrigin:MTLOriginMake(0, 0, 0)
-                   sourceSize:MTLSizeMake(w, h, 1)
-                    toTexture:dstTex
-             destinationSlice:slice
-             destinationLevel:0
-            destinationOrigin:MTLOriginMake(0, 0, 0)];
       }
+      [enc endEncoding];
     }
-    [blit endEncoding];
-    static unsigned long s_blitFrames = 0;
-    const unsigned long blitN = s_blitFrames++;
-    if (blitN < 5 || (blitN % 300) == 0) {
-      NSLog(@"[dusk::vision] blitted L+R eyes (%lux%lu) into drawable views (frame #%lu)",
-            (unsigned long)eyeTex[0].width, (unsigned long)eyeTex[0].height, blitN);
-    }
-  } else {
-    static unsigned long s_noTexFrames = 0;
-    if ((s_noTexFrames++ % 300) == 0) {
-      NSLog(@"[dusk::vision] presentStereoFrame: eye MTLTexture unavailable");
-    }
+  }
+  static unsigned long s_panelFrames = 0;
+  const unsigned long panelN = s_panelFrames++;
+  if (panelN < 5 || (panelN % 300) == 0) {
+    NSLog(@"[dusk::vision] world-locked panel: drawPanel=%d poseOk=%d anchored=%d (frame #%lu)",
+          drawPanel ? 1 : 0, framePoseOk ? 1 : 0, g_havePanelAnchor ? 1 : 0, panelN);
   }
 
   // Always encode_present + commit (CompositorServices contract; skipping aborts end_submission).
@@ -579,6 +795,35 @@ void runStereoPresentLoop(cp_layer_renderer_t layerRenderer) noexcept {
 // aurora_end_frame(). All Dawn-device work (import, BeginAccess/EndAccess) lives here because the
 // Dawn device is engine-thread-only; see StereoEngine.h for the full rationale.
 // ----------------------------------------------------------------------------------------------
+
+// Engine thread, called at FRAME START (before the game's camera/draw runs). Snapshot the present
+// thread's latest tracked anchor as the render anchor for this frame and feed its transform to the
+// head-look hook, so the camera the game bakes and the anchor the present sets on the drawable use the
+// SAME pose. The compositor then reprojects that pose to the live display pose (90Hz), smoothing head
+// motion for both eyes. No-op until the present thread has produced a tracked anchor.
+// Engine thread: select the visionOS stereo presentation. Mirrors game.visionWorldLockedScreen into the
+// present thread (which can't read settings directly). true = world-locked quad, false = face-locked blit.
+void stereo_set_world_locked(bool worldLocked) noexcept {
+  g_worldLockedScreen.store(worldLocked, std::memory_order_relaxed);
+}
+
+void stereo_engine_latch_head_pose() noexcept {
+  ar_device_anchor_t latched = nil;
+  {
+    std::lock_guard<std::mutex> lk(g_anchorMutex);
+    if (g_latestQueriedAnchor != nil) {
+      g_renderAnchor = g_latestQueriedAnchor;
+      latched = g_renderAnchor;
+    }
+  }
+  if (latched != nil) {
+    const simd_float4x4 headXform = ar_device_anchor_get_origin_from_anchor_transform(latched);
+    float headMtx[16];
+    memcpy(headMtx, &headXform, sizeof(float) * 16);
+    dusk::vision::headlook::setHeadTransform(headMtx, true);
+  }
+}
+
 void stereo_engine_frame_begin() noexcept {
   // Heartbeat: proves the ENGINE thread is actually reaching aurora_end_frame on device. If this
   // never appears in Console.app, the engine frame loop isn't running -- the real bug. NSLog (not

@@ -20,11 +20,24 @@ namespace dusk::vision::headlook {
 namespace {
 
 // ---- On-device tuning knobs (sign/axis are unknown until tested on hardware) -------------------
-// If head-look goes the wrong way, flip the matching sign. kLookScale 1.0 == 1:1 head->camera.
-constexpr float kYawSign = 1.0f;      // head turn right -> camera turn right (flip if inverted)
-constexpr float kPitchSign = -1.0f;   // head look up -> camera look up (flipped: device was inverted)
-constexpr float kLookScale = 1.0f;    // overall gain
-constexpr bool kEnablePitch = true;   // set false to restrict to yaw-only while tuning
+// Full-matrix head-look: apply the head's relative VIEW change (inverse of its motion since recenter)
+// directly to the game view matrix. Correct at ALL head orientations -- unlike the old yaw/pitch
+// decomposition, which reversed pitch/roll past ~90deg. ARKit head-view space matches TP's view space
+// (right-handed, X-right/Y-up/Z-back, looking -Z, per mDoMtx_lookAt), so it maps with no basis change.
+// kBasis{X,Y,Z} are an on-device escape hatch if an axis turns out inverted; keep an EVEN count of -1
+// (odd = a mirror/reflection). kHeadTranslateScale = game units per real meter (TP's world scale is
+// unknown -> tune; 0 disables translation = pure 3DoF). It is THE comfort knob.
+constexpr float kBasisX = 1.0f;
+constexpr float kBasisY = 1.0f;
+constexpr float kBasisZ = 1.0f;
+constexpr float kHeadTranslateScale = 50.0f;
+// TEST: the gameplay loop rewrites the camera every frame, fighting the additive head-look. While the
+// head is ~centered we track the game's live camera (it follows Link normally); once the head moves
+// past these thresholds we FREEZE that base and let head-look drive from it, so the game can't cancel
+// head movement. Set kFreezeBaseCamera false to restore pure-additive behavior.
+constexpr bool kFreezeBaseCamera = true;
+constexpr float kCenterRotRad = 0.05f;   // ~3 deg from forward counts as "centered"
+constexpr float kCenterTransM = 0.03f;   // 3 cm
 // ------------------------------------------------------------------------------------------------
 
 std::mutex g_mutex;
@@ -40,7 +53,6 @@ simd_float4x4 matFromFloats(const float m[16]) noexcept {
 }
 
 constexpr float kPi = 3.14159265358979323846f;
-constexpr float kRadToS16 = 32768.0f / kPi;  // GameCube angle units: 0x8000 == pi
 
 }  // namespace
 
@@ -83,32 +95,56 @@ void apply(float (*viewMtx)[4], bool suppressed) noexcept {  // viewMtx is a Gam
     ref = g_reference;
   }
 
-  // Head rotation relative to the recenter reference, expressed in the reference frame.
+  // Head pose relative to the recenter reference, in the reference frame.
   const simd_float4x4 rel = simd_mul(simd_inverse(ref), cur);
   // ARKit cameras look down -Z; rel.columns[2] is the head's +Z basis in the reference frame.
   const simd_float3 fwd = -simd_make_float3(rel.columns[2].x, rel.columns[2].y, rel.columns[2].z);
+  const simd_float3 t = simd_make_float3(rel.columns[3].x, rel.columns[3].y, rel.columns[3].z);
 
-  float yaw = std::atan2(fwd.x, -fwd.z);                              // about world up (Y)
-  float pitch = std::asin(std::fmax(-1.0f, std::fmin(1.0f, fwd.y)));  // about right (X)
-  yaw *= kYawSign * kLookScale;
-  pitch *= kPitchSign * kLookScale;
+  const float rotMag = std::acos(std::fmax(-1.0f, std::fmin(1.0f, -fwd.z)));  // head angle from forward
 
-  const s16 yawS = static_cast<s16>(yaw * kRadToS16);
-  const s16 pitchS = kEnablePitch ? static_cast<s16>(pitch * kRadToS16) : 0;
+  // Stop the gameplay loop from fighting head movement: while the head is ~centered, track the game's
+  // live camera (so it follows Link normally); once the head moves off-center, FREEZE that base so the
+  // game's per-frame camera rewrite can't cancel the head offset. Engine-thread only (no lock).
+  static Mtx s_frozenView;
+  static bool s_haveFrozen = false;
+  if (kFreezeBaseCamera) {
+    const bool centered = (rotMag < kCenterRotRad) && (simd_length(t) < kCenterTransM);
+    if (centered || !s_haveFrozen) {
+      cMtx_copy(viewMtx, s_frozenView);  // track the game camera while centered
+      s_haveFrozen = true;
+    } else {
+      cMtx_copy(s_frozenView, viewMtx);  // hold the base while the head is moved -> game can't fight
+    }
+  }
 
-  // Build the additive head rotation (yaw about Y, then pitch about X) and compose it onto the view
-  // matrix in view space (pre-multiply). Output via a temp to avoid any in-place-aliasing assumption.
-  Mtx headRot;
-  mDoMtx_YrotS(headRot, yawS);
-  mDoMtx_XrotM(headRot, pitchS);
+  // Full-matrix head-look: compose the head's relative VIEW change onto the (frozen) view matrix in view
+  // space. inverse(rel) IS that view change (rel = head motion since recenter); the basis conjugation
+  // (identity by default) is an on-device escape hatch for axis-sign fixes. Convert the simd (column-
+  // major) result to a GameCube Mtx (row-major 3x4) and scale ONLY the translation column (meters ->
+  // game units). Using the full matrix -- not a yaw/pitch decomposition -- keeps it correct at ANY head
+  // orientation, with no 180-degree reversal.
+  simd_float4x4 basis = matrix_identity_float4x4;
+  basis.columns[0].x = kBasisX;
+  basis.columns[1].y = kBasisY;
+  basis.columns[2].z = kBasisZ;
+  const simd_float4x4 H = simd_inverse(simd_mul(simd_mul(basis, rel), basis));
+  Mtx headOffset;
+  for (int r = 0; r < 3; ++r) {
+    headOffset[r][0] = H.columns[0][r];
+    headOffset[r][1] = H.columns[1][r];
+    headOffset[r][2] = H.columns[2][r];
+    headOffset[r][3] = H.columns[3][r] * kHeadTranslateScale;  // meters -> game units
+  }
   Mtx out;
-  cMtx_concat(headRot, viewMtx, out);
+  cMtx_concat(headOffset, viewMtx, out);
   cMtx_copy(out, viewMtx);
 
   static unsigned long s_diag = 0;
   if ((s_diag++ % 120) == 0) {
-    os_log(OS_LOG_DEFAULT, "[dusk::vision] headlook yaw=%.1f pitch=%.1f deg",
-           (double)(yaw * 180.0f / kPi), (double)(pitch * 180.0f / kPi));
+    os_log(OS_LOG_DEFAULT, "[dusk::vision] headlook rot=%.1fdeg t=(%.1f,%.1f,%.1f)cm",
+           (double)(rotMag * 180.0f / kPi), (double)(t.x * 100.0f), (double)(t.y * 100.0f),
+           (double)(t.z * 100.0f));
   }
 }
 
