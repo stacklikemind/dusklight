@@ -12,7 +12,9 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 
+#include "dusk/vision/HeadLook.h"
 #include "dusk/vision/StereoEngine.h"
 #include "dusk/vision/StereoEntry.h"
 #include "webgpu/gpu.hpp"  // aurora::webgpu::set_stereo_capture_target (extern/aurora/lib on include path)
@@ -98,6 +100,12 @@ bool attachDeviceAnchor(cp_drawable_t drawable) {
                   ar_device_anchor_is_tracked(anchor);
   if (ok) {
     cp_drawable_set_device_anchor(drawable, anchor);
+    // Publish the head pose to the head-look camera hook (the engine thread reads it). Head-look only
+    // consumes it when the in-game setting is on; otherwise this is a cheap, unused store.
+    const simd_float4x4 headXform = ar_device_anchor_get_origin_from_anchor_transform(anchor);
+    float headMtx[16];
+    memcpy(headMtx, &headXform, sizeof(float) * 16);
+    dusk::vision::headlook::setHeadTransform(headMtx, true);
   }
   static unsigned long s_anchorFrames = 0;
   const unsigned long anchorN = s_anchorFrames++;

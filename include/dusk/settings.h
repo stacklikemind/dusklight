@@ -212,6 +212,9 @@ struct UserSettings {
         std::array<ConfigVar<bool>, 4> enableLED;
         ConfigVar<bool> swapDirectSelect;
 
+        // visionOS
+        ConfigVar<bool> visionHeadLook;
+
         // Cheats
         ConfigVar<bool> infiniteHearts;
         ConfigVar<bool> infiniteArrows;

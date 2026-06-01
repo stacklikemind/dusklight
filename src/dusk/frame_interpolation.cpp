@@ -6,6 +6,13 @@
 
 #include <absl/container/flat_hash_map.h>
 
+#include "dusk/vision/HeadLook.h"  // visionOS head-look (self-guarding; empty off-visionOS)
+#if defined(__APPLE__) && defined(TARGET_OS_VISION) && TARGET_OS_VISION
+#include "d/d_attention.h"
+#include "d/d_camera.h"
+#include "d/d_com_inf_game.h"
+#endif
+
 namespace {
 
 struct Recording {
@@ -384,6 +391,15 @@ void begin_presentation_camera() {
     mDoMtx_lookAt(view->viewMtx, &view->lookat.eye, &view->lookat.center, &view->lookat.up, view->bank);
 #if WIDESCREEN_SUPPORT
     mDoGph_gInf_c::setWideZoomProjection(view->projMtx);
+#endif
+#if defined(__APPLE__) && defined(TARGET_OS_VISION) && TARGET_OS_VISION
+    // Dusk visionOS head-look (also applied here so it survives when frame interpolation is on, which
+    // rebuilds the view matrix at presentation). Suppressed under scripted camera control.
+    {
+        dAttention_c* att = dComIfGp_getAttention();
+        const bool suppressed = dComIfGp_evmng_cameraPlay() != 0 || (att != nullptr && att->Lockon());
+        dusk::vision::headlook::apply(view->viewMtx, suppressed);
+    }
 #endif
     j3dSys.setViewMtx(view->viewMtx);
     cMtx_inverse(view->viewMtx, view->invViewMtx);

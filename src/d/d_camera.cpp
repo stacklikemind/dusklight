@@ -32,6 +32,7 @@
 #include "dusk/frame_interpolation.h"
 #include "dusk/logging.h"
 #include "dusk/action_bindings.h"
+#include "dusk/vision/HeadLook.h"  // visionOS head-look (self-guarding; empty off-visionOS)
 #include "imgui.h"
 #endif
 
@@ -11420,6 +11421,15 @@ static int camera_draw(camera_process_class* i_this) {
     mDoGph_gInf_c::setWideZoomProjection(process->view.projMtx);
 #endif
 
+#if defined(__APPLE__) && defined(TARGET_OS_VISION) && TARGET_OS_VISION
+    // Dusk visionOS head-look: additively rotate the camera by the headset orientation, unless the
+    // camera is under scripted control (cutscene / Z-lock-on). No-op when the head-look setting is off.
+    {
+        dAttention_c* att = dComIfGp_getAttention();
+        const bool suppressed = dComIfGp_evmng_cameraPlay() != 0 || (att != nullptr && att->Lockon());
+        dusk::vision::headlook::apply(process->view.viewMtx, suppressed);
+    }
+#endif
     j3dSys.setViewMtx(process->view.viewMtx);
     cMtx_inverse(process->view.viewMtx, process->view.invViewMtx);
 

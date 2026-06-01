@@ -105,6 +105,9 @@ UserSettings g_userSettings = {
         },
         .swapDirectSelect {"game.swapDirectSelect", false},
 
+        // visionOS
+        .visionHeadLook {"game.visionHeadLook", true},
+
         // Cheats
         .infiniteHearts {"game.infiniteHearts", false},
         .infiniteArrows {"game.infiniteArrows", false},
@@ -292,6 +295,7 @@ void registerSettings() {
     Register(g_userSettings.game.gyroInvertPitch);
     Register(g_userSettings.game.gyroInvertYaw);
     Register(g_userSettings.game.freeCamera);
+    Register(g_userSettings.game.visionHeadLook);
     Register(g_userSettings.game.debugFlyCam);
     Register(g_userSettings.game.debugFlyCamLockEvents);
     Register(g_userSettings.game.allowBackgroundInput);

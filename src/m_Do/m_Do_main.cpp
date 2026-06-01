@@ -623,6 +623,15 @@ int game_main(int argc, char* argv[]) {
     // visionOS pins a fixed 64:27 (21:9) content frame (see updateRenderSize()),
     // so Aurora must always letterbox/pillarbox it into the real display.
     AuroraSetViewportPolicy(AURORA_VIEWPORT_FIT);
+    // Head-look is applied in the camera path, which updates at the ~30Hz sim rate -- on the 90Hz
+    // display that reads as stepping during head motion. Frame interpolation drives the
+    // presentation-camera path (where head-look is also applied) at a higher rate, smoothing it. Enable
+    // it when head-look is on (overriding a default/persisted Off; Capped to avoid spinning the render
+    // loop into the CPU-wake watchdog). Turn off game.visionHeadLook to opt out.
+    if (dusk::getSettings().game.visionHeadLook.getValue() &&
+        dusk::getSettings().game.enableFrameInterpolation.getValue() == dusk::FrameInterpMode::Off) {
+        dusk::getSettings().game.enableFrameInterpolation.setValue(dusk::FrameInterpMode::Capped);
+    }
 #else
     if (dusk::getSettings().video.lockAspectRatio) {
         AuroraSetViewportPolicy(AURORA_VIEWPORT_FIT);

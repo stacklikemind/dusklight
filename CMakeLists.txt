@@ -644,7 +644,8 @@ if (VISIONOS)
     find_library(ARKIT_FRAMEWORK ARKit REQUIRED)
     target_sources(dusklight PRIVATE
         src/dusk/vision/StereoBridge.mm
-        src/dusk/vision/StereoPresent.mm)
+        src/dusk/vision/StereoPresent.mm
+        src/dusk/vision/HeadLook.cpp)
 
     # ---------------------------------------------------------------------------------------------
     # Scene-activation seam: SwiftUI @main app + ImmersiveSpace/CompositorLayer. visionOS-only.
