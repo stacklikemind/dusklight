@@ -240,17 +240,27 @@ static void ensurePanelPipeline(id<MTLDevice> device, MTLPixelFormat colorFmt,
     NSLog(@"[dusk::vision] panel pipeline build failed: %@", err);
     return;
   }
+  // REVERSE-Z depth (the visionOS/CompositorServices convention): the quad writes its true perspective
+  // depth, the buffer is cleared to 0.0 (= the far plane) and STORED, and the test keeps the NEARER
+  // (greater) depth. The compositor consumes this per-eye depth to do depth-based positional/parallax
+  // reprojection as the head moves -- submitting standard-Z (clear 1.0 / LessEqual) made it misread the
+  // depth, which is why head-lean produced NO parallax and motion juddered. (WWDC24 "Render Metal with
+  // passthrough in visionOS": the depth texture must be reverse-Z, cleared to 0.0, storeAction = store.)
   MTLDepthStencilDescriptor* dd = [[MTLDepthStencilDescriptor alloc] init];
-  dd.depthCompareFunction = MTLCompareFunctionLessEqual;
+  dd.depthCompareFunction = MTLCompareFunctionGreaterEqual;
   dd.depthWriteEnabled = YES;
   g_panelDepthState = [device newDepthStencilStateWithDescriptor:dd];
   NSLog(@"[dusk::vision] world-locked panel pipeline ready (color=%lu depth=%lu)",
         (unsigned long)colorFmt, (unsigned long)depthFmt);
 }
 
-// Query this frame's predicted head pose (origin_from_device) for positioning the world-locked quad.
-// Returns false until world tracking yields a tracked pose. Present-thread only.
-static bool currentFramePose(cp_drawable_t drawable, simd_float4x4* outPose) noexcept {
+// Query this frame's predicted head pose (origin_from_device) for positioning the world-locked quad, and
+// hand back the SAME anchor object so the caller can set it on the drawable -- the pose the quad is
+// rendered for must be byte-identical to the pose the compositor reprojects from, or head motion shears
+// the frame (worst at the screen edges). Returns false until world tracking yields a tracked pose.
+// Present-thread only.
+static bool currentFramePose(cp_drawable_t drawable, simd_float4x4* outPose,
+                             ar_device_anchor_t* outAnchor) noexcept {
   if (g_worldProvider == nil ||
       ar_data_provider_get_state(g_worldProvider) != ar_data_provider_state_running) {
     return false;
@@ -265,6 +275,7 @@ static bool currentFramePose(cp_drawable_t drawable, simd_float4x4* outPose) noe
     return false;
   }
   *outPose = ar_device_anchor_get_origin_from_anchor_transform(a);
+  *outAnchor = a;  // reused as the drawable's device anchor below -> render pose == reprojection pose
   return true;
 }
 
@@ -347,7 +358,7 @@ static void renderFaceLockedPanel(id<MTLCommandBuffer> commandBuffer, cp_drawabl
       dp.depthAttachment.slice = slice;
       dp.depthAttachment.loadAction = MTLLoadActionClear;
       dp.depthAttachment.storeAction = MTLStoreActionStore;
-      dp.depthAttachment.clearDepth = 1.0;
+      dp.depthAttachment.clearDepth = 0.0;  // reverse-Z far (visionOS convention)
       id<MTLRenderCommandEncoder> denc = [commandBuffer renderCommandEncoderWithDescriptor:dp];
       [denc endEncoding];
     }
@@ -596,7 +607,7 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
           rp.depthAttachment.slice = slice;
           rp.depthAttachment.loadAction = MTLLoadActionClear;
           rp.depthAttachment.storeAction = MTLStoreActionStore;
-          rp.depthAttachment.clearDepth = 1.0;
+          rp.depthAttachment.clearDepth = 0.0;  // reverse-Z far (visionOS convention)
         }
         id<MTLRenderCommandEncoder> enc = [commandBuffer renderCommandEncoderWithDescriptor:rp];
         if (enc == nil) {
@@ -665,7 +676,8 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
   // color and depth per view (depth is REQUIRED on device or the compositor scans out black; it also
   // drives reprojection); the quad is drawn on top once a pose + eye textures + pipeline are ready.
   simd_float4x4 originFromDevice = matrix_identity_float4x4;
-  const bool framePoseOk = currentFramePose(drawables[0], &originFromDevice);
+  ar_device_anchor_t frameAnchor = nil;
+  const bool framePoseOk = currentFramePose(drawables[0], &originFromDevice, &frameAnchor);
   if (framePoseOk && !g_havePanelAnchor) {
     g_panelAnchorPose = originFromDevice;
     g_havePanelAnchor = true;
@@ -725,7 +737,7 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
         rp.depthAttachment.slice = slice;
         rp.depthAttachment.loadAction = MTLLoadActionClear;
         rp.depthAttachment.storeAction = MTLStoreActionStore;
-        rp.depthAttachment.clearDepth = 1.0;
+        rp.depthAttachment.clearDepth = 0.0;  // reverse-Z: 0.0 == far (untouched pixels = far plane)
       }
       id<MTLRenderCommandEncoder> enc = [commandBuffer renderCommandEncoderWithDescriptor:rp];
       if (enc == nil) {
@@ -762,9 +774,19 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
   }
 
   // Always encode_present + commit (CompositorServices contract; skipping aborts end_submission).
-  // Frames without a tracked anchor are dropped by the compositor itself, harmlessly.
+  // Set the SAME anchor the quad was rendered for (frameAnchor) as each drawable's device anchor, so the
+  // compositor reprojects from exactly that pose -- NOT a second, independently-predicted query (which
+  // diverges from the render pose during head motion and shears the screen at the edges). An untracked
+  // frame sets no anchor and the compositor drops it, harmlessly. Mirror it into g_latestQueriedAnchor so
+  // the engine head-look latch stays current if the user later switches to the face-locked mode.
+  if (framePoseOk) {
+    std::lock_guard<std::mutex> lk(g_anchorMutex);
+    g_latestQueriedAnchor = frameAnchor;
+  }
   for (size_t i = 0; i < drawableCount; ++i) {
-    attachDeviceAnchor(drawables[i]);
+    if (framePoseOk) {
+      cp_drawable_set_device_anchor(drawables[i], frameAnchor);
+    }
     cp_drawable_encode_present(drawables[i], commandBuffer);
   }
   [commandBuffer commit];

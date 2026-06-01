@@ -81,7 +81,13 @@ void apply(float (*viewMtx)[4], bool suppressed) noexcept {  // viewMtx is a Gam
   if (suppressed) {
     return;  // scripted camera (cutscene / Z-lock-on) -- leave the game's camera untouched
   }
-  if (!dusk::getSettings().game.visionHeadLook.getValue()) {
+  // Head-look runs ONLY in the face-locked mode. In the world-locked screen (the default) the compositor
+  // already handles head motion by reprojecting the fixed screen; driving the game camera from the head
+  // there pans the on-screen CONTENT against the FIXED screen frame -> "fighting" at the edges (and only
+  // during gameplay, since head-look is suppressed in cutscenes). Gating on the mode also overrides a
+  // persisted game.visionHeadLook=true from before the default flipped off.
+  if (dusk::getSettings().game.visionWorldLockedScreen.getValue() ||
+      !dusk::getSettings().game.visionHeadLook.getValue()) {
     return;
   }
 
