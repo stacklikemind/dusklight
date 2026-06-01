@@ -140,8 +140,17 @@ bool g_didBeginThisFrame[kEyeCount]{false, false};
 // eye strain); 0 = mono. Flip the sign mapping below if depth feels inverted (near/far swapped).
 // kStereoConvergence: off-axis convergence shift (m0.z -= convergence); 0 = convergence at infinity.
 // Start near 0 and raise slightly to pull the zero-parallax plane closer.
-static constexpr float kStereoEyeSep = 4.0f;       // game units; on-device tuning knob
-static constexpr float kStereoConvergence = 0.0f;  // start at 0
+static constexpr float kStereoEyeSep = 0.5f;        // game units; small -- even 1.0 strained on device
+// Per-eye NDC horizontal panel shift, applied OPPOSITE per eye (left +c, right -c) as a blit offset, to
+// converge the flat panel so it fuses. ~0.25 found on device (the AVP per-eye projection is strongly
+// off-axis, so a large shift is needed). This is the constant offset; eyeSep adds depth around it.
+static constexpr float kStereoConvergence = 0.25f;
+
+// On-device tuning: when 1, ignore kStereoEyeSep/kStereoConvergence and instead run a tuning sweep in
+// stereo_engine_frame_begin() (a few seconds per stable step) so a value can be picked by eye in ONE run.
+// Currently sweeps PANEL CONVERGENCE (a per-eye horizontal slide) to fuse the flat panel; set back to 0
+// and bake the chosen value once dialed in. See stereo_engine_frame_begin().
+#define STEREO_EYESEP_SWEEP 0
 }  // namespace
 
 // Publish (once) TWO IOSurfaces (left + right), each sized to the compositor drawable's per-eye color
@@ -586,8 +595,8 @@ void stereo_engine_frame_begin() noexcept {
         // (flip if depth feels inverted). Aurora applies B = -eyeSep * focalX as a per-draw clip.x
         // shift, leaving orthographic (HUD/2D) draws untouched.
         aurora::webgpu::set_stereo_eye_targets(g_eye[0].view(), g_eye[1].view(), w, h,
-                                               /*eyeSepLeft=*/-kStereoEyeSep, kStereoConvergence,
-                                               /*eyeSepRight=*/+kStereoEyeSep, kStereoConvergence);
+                                               /*eyeSepLeft=*/-kStereoEyeSep, /*convLeft=*/+kStereoConvergence,
+                                               /*eyeSepRight=*/+kStereoEyeSep, /*convRight=*/-kStereoConvergence);
         g_engineInitDone = true;
         g_eyeReady.store(true, std::memory_order_release);
         NSLog(@"[dusk::vision] engine imported two %ux%u eye textures; TRUE stereo ARMED (eyeSep=%.2f conv=%.2f)",
@@ -604,6 +613,39 @@ void stereo_engine_frame_begin() noexcept {
   // Open shared-texture access for both eyes this frame. Must precede aurora_end_frame(), which
   // records and submits the per-eye replays that write the shared textures.
   if (g_engineInitDone) {
+#if STEREO_EYESEP_SWEEP
+    // On-device PANEL CONVERGENCE sweep. The reported problem is a large CONSTANT inter-eye offset that
+    // the eyeSep (depth-only) sweep couldn't budge -- i.e. the flat panel isn't fused. This sweep slides
+    // the two eye images horizontally in OPPOSITE directions (a gross, unmistakable shift done in the eye
+    // blit) while holding eyeSep at 0 (no scene parallax), so the goal is simply: find the step where the
+    // image merges into ONE. kSweep is the per-eye NDC x-shift; left eye gets +c, right eye -c. Because
+    // this shift happens in the blit that already fills the eyes, "no change at all" would mean the
+    // per-eye path isn't reaching the display (a deeper bug) rather than a tuning miss. Once the fusing
+    // step is found we lock that convergence and bring eyeSep back for depth. Set STEREO_EYESEP_SWEEP 0
+    // and kStereoConvergence/kStereoEyeSep when dialed in.
+    // Panel convergence is now LOCKED at kStereoConvergence (the flat panel fuses). Sweep eyeSep -- the
+    // scene DEPTH parallax -- so the 3D amount can be picked by eye. Step 1 = 0 (flat, no depth); depth
+    // grows each step. Report the comfortable step, where it becomes too much / strains, and whether
+    // depth pops TOWARD you (correct) or sinks in wrong (inverted -> flip the eyeSep sign mapping).
+    static const float kSweep[] = {0.0f, 1.0f, 2.0f, 4.0f, 6.0f, 9.0f, 12.0f};
+    static const int kSweepN = static_cast<int>(sizeof(kSweep) / sizeof(kSweep[0]));
+    static const unsigned long kHoldFrames = 90;  // ~3-4 s per step
+    static unsigned long s_sweepFrame = 0;
+    static int s_lastStep = -1;
+    const int step = static_cast<int>((s_sweepFrame / kHoldFrames) % static_cast<unsigned long>(kSweepN));
+    const float sep = kSweep[step];
+    if (step != s_lastStep) {
+      s_lastStep = step;
+      NSLog(@"[dusk::vision] EYESEP SWEEP step %d/%d eyeSep=%.2f conv=%.2f (steps from 1; step 1 = flat)",
+            step + 1, kSweepN, (double)sep, (double)kStereoConvergence);
+    }
+    ++s_sweepFrame;
+    aurora::webgpu::set_stereo_eye_targets(g_eye[0].view(), g_eye[1].view(),
+                                           g_pendingWidth.load(std::memory_order_relaxed),
+                                           g_pendingHeight.load(std::memory_order_relaxed),
+                                           /*eyeSepLeft=*/-sep, /*convLeft=*/+kStereoConvergence,
+                                           /*eyeSepRight=*/+sep, /*convRight=*/-kStereoConvergence);
+#endif
     g_didBeginThisFrame[0] = g_eye[0].beginAccess();
     g_didBeginThisFrame[1] = g_eye[1].beginAccess();
   }
