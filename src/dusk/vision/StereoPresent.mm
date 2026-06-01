@@ -248,10 +248,35 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
           drawableCount, texCount, viewCount,
           c0 ? (unsigned long)c0.width : 0UL, c0 ? (unsigned long)c0.height : 0UL,
           z0 ? "YES" : "nil", g_eyeReady.load(std::memory_order_acquire) ? 1 : 0);
+    // Diagnostic for the black-screen-on-device bug: dump the color texture's actual format/usage/
+    // sample-count/type plus the drawable's rasterization-rate-map count and state. A usage mask
+    // WITHOUT MTLTextureUsageRenderTarget(0x4) would explain why a render-pass clear scans out black.
+    if (c0 != nil) {
+      NSLog(@"[dusk::vision] color0 fmt=%lu usage=0x%lx samples=%lu type=%lu rateMaps=%zu drawState=%d",
+            (unsigned long)c0.pixelFormat, (unsigned long)c0.usage,
+            (unsigned long)c0.sampleCount, (unsigned long)c0.textureType,
+            cp_drawable_get_rasterization_rate_map_count(d0), (int)cp_drawable_get_state(d0));
+    }
   }
 
   id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
   commandBuffer.label = @"Dusk Stereo Present";
+
+  // Decisive black-screen diagnostic: log whether the present command buffer (clear + encode_present)
+  // actually executes on the GPU. status=4 (Completed) + error=none => our GPU work succeeded and the
+  // black screen is a COMPOSITOR/scene-display problem, not our rendering. status=5 (Error) => the
+  // error string names the GPU failure. (MTLCommandBufferStatus: NotEnqueued0 Enqueued1 Committed2
+  // Scheduled3 Completed4 Error5.) First few frames + every ~300.
+  {
+    static unsigned long s_cbFrames = 0;
+    const unsigned long cbN = s_cbFrames++;
+    if (cbN < 5 || (cbN % 300) == 0) {
+      [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        NSLog(@"[dusk::vision] cmdbuf #%lu status=%ld error=%@", cbN, (long)cb.status,
+              cb.error ? cb.error.localizedDescription : @"none");
+      }];
+    }
+  }
 
   if (!g_eyeReady.load(std::memory_order_acquire)) {
     // The engine hasn't imported the shared eye texture yet. Publish a correctly-sized IOSurface
@@ -278,17 +303,14 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
   // bypassing the IOSurface entirely. If you SEE red/blue -> present+scene+per-eye mapping are good,
   // bug is the captured content/alpha. If still black -> the present/scene path itself isn't showing.
   // Set false to restore the real IOSurface eye blit.
-  // RESULT (2026-06-01, device): with .immersionStyle(.full) the immersive space DOES open, but the
-  // forced opaque red/blue clear is STILL BLACK -- so the bug is NOT content/alpha; our per-frame
-  // render into cp_drawable_get_color_texture isn't being scanned out. cp_drawable_get_color_texture
-  // is the correct destination (header-confirmed) and the traditional cp_drawable_encode_present path
-  // is right, so the prime remaining suspect is the LAYER LAYOUT / render-loop shape: device gives a
-  // layered drawable (texCount=1, viewCount=2) and likely expects one render pass with
-  // renderTargetArrayLength=viewCount (+ rasterization rate map / view-texture-map), not two separate
-  // single-slice clears, AND the CompositorLayer needs an explicit layout configuration (we use a bare
-  // `CompositorLayer { }`). Next: match Apple's canonical fully-immersive render loop exactly. See
-  // docs/stereo-spike-interop.md §9.17.
-  static constexpr bool kForceEyeClearTest = true;
+  // RESOLVED (2026-06-01, device): the black screen was NEVER the color path -- it was a MISSING DEPTH
+  // WRITE. visionOS reprojects every presented frame using the drawable's depth texture; a real AVP
+  // scans out black for a frame whose depth wasn't written+stored (the sim is lenient). Once this clear
+  // pass also clears+stores cp_drawable_get_depth_texture (see below), the forced red(L)/blue(R) showed
+  // per-eye on device. Layout (dedicated vs layered) was a red herring -- both work once depth is
+  // written. This force-clear stays as a kept diagnostic; flip true to re-verify the present path
+  // independent of the engine/IOSurface. See docs/stereo-spike-interop.md §9.17-§9.19.
+  static constexpr bool kForceEyeClearTest = false;
   if (kForceEyeClearTest) {
     for (size_t d = 0; d < drawableCount; ++d) {
       cp_drawable_t drawable = drawables[d];
@@ -309,7 +331,27 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
         rp.colorAttachments[0].clearColor =
             (view == 0) ? MTLClearColorMake(1.0, 0.0, 0.0, 1.0)   // left eye: opaque red
                         : MTLClearColorMake(0.0, 0.0, 1.0, 1.0);  // right eye: opaque blue
+        // visionOS's compositor reprojects every presented frame using the drawable's DEPTH texture.
+        // A real device can blank a frame whose depth wasn't produced (the sim is lenient). We were
+        // rendering color-only -> suspected cause of the all-black scanout. Attach + clear + STORE the
+        // depth texture so the compositor has valid depth to reproject our flat clear.
+        id<MTLTexture> dstDepth = cp_drawable_get_depth_texture(drawable, texIndex);
+        if (dstDepth != nil) {
+          rp.depthAttachment.texture = dstDepth;
+          rp.depthAttachment.slice = slice;
+          rp.depthAttachment.loadAction = MTLLoadActionClear;
+          rp.depthAttachment.storeAction = MTLStoreActionStore;
+          rp.depthAttachment.clearDepth = 1.0;
+        }
         id<MTLRenderCommandEncoder> enc = [commandBuffer renderCommandEncoderWithDescriptor:rp];
+        if (enc == nil) {
+          static unsigned long s_nilEnc = 0;
+          if ((s_nilEnc++ % 300) == 0) {
+            NSLog(@"[dusk::vision] FORCE-CLEAR: NIL render encoder (view=%zu tex=%p) -- clear not issued!",
+                  view, (__bridge void*)dstTex);
+          }
+          continue;
+        }
         enc.label = @"Dusk Eye Clear Test";
         [enc endEncoding];
       }
@@ -317,7 +359,7 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
     static unsigned long s_clearFrames = 0;
     const unsigned long clearN = s_clearFrames++;
     if (clearN < 5 || (clearN % 300) == 0) {
-      NSLog(@"[dusk::vision] FORCE-CLEAR test: red(L)/blue(R) into eyes (frame #%lu)", clearN);
+      NSLog(@"[dusk::vision] FORCE-CLEAR test: red(L)/blue(R)+depth into eyes (frame #%lu)", clearN);
     }
     for (size_t i = 0; i < drawableCount; ++i) {
       attachDeviceAnchor(drawables[i]);
@@ -342,6 +384,31 @@ bool presentStereoFrame(cp_layer_renderer_t layerRenderer) noexcept {
   }
   // TODO(stereo): if no fence was exported, fall back to a coarse sync -- e.g. ensure the producing
   // Dawn submission has completed on the CPU before this point.
+
+  // REQUIRED on device: write+store each eye's DEPTH texture or the compositor scans out BLACK (the
+  // simulator is lenient). The color comes from the blit below; depth has no source, so clear+store
+  // it via a depth-only render pass per eye. Different textures from the blit -> no ordering hazard.
+  for (size_t d = 0; d < drawableCount; ++d) {
+    cp_drawable_t drawable = drawables[d];
+    const size_t viewCount = cp_drawable_get_view_count(drawable);
+    const size_t texCount = cp_drawable_get_texture_count(drawable);
+    for (size_t view = 0; view < viewCount; ++view) {
+      const size_t texIndex = (texCount >= viewCount) ? view : 0;
+      const NSUInteger slice = (texCount >= viewCount) ? 0 : (NSUInteger)view;
+      id<MTLTexture> depthTex = cp_drawable_get_depth_texture(drawable, texIndex);
+      if (depthTex == nil) {
+        continue;
+      }
+      MTLRenderPassDescriptor* dp = [MTLRenderPassDescriptor renderPassDescriptor];
+      dp.depthAttachment.texture = depthTex;
+      dp.depthAttachment.slice = slice;
+      dp.depthAttachment.loadAction = MTLLoadActionClear;
+      dp.depthAttachment.storeAction = MTLStoreActionStore;
+      dp.depthAttachment.clearDepth = 1.0;
+      id<MTLRenderCommandEncoder> denc = [commandBuffer renderCommandEncoderWithDescriptor:dp];
+      [denc endEncoding];
+    }
+  }
 
   if (srcTex != nil) {
     id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];

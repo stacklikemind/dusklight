@@ -18,6 +18,7 @@
 import SwiftUI
 import CompositorServices
 import Foundation
+import Metal
 
 // Identifier for the transient launch window so we can dismiss it once the immersive space opens.
 private let kLaunchWindowID = "DuskLaunch"
@@ -55,10 +56,52 @@ private func startEngineOnce() { _ = engineStart }
 // C `cp_layer_renderer_t`. We pass it to C as an opaque pointer; the .mm side casts it back. The
 // present loop blocks, so it runs on its own thread.
 // CompositorContent / CompositorLayer's CompositorContent-based initializer is visionOS 26.0+.
+// Layer configuration. We request DEDICATED layout (one MTLTexture per eye) -- which the device DOES
+// honor (logs then show texCount=2). Dedicated alone did NOT fix the black screen, so the remaining
+// suspect is texture USAGE: our force-clear / per-view path writes via a *render pass* into
+// cp_drawable_get_color_texture, which requires MTLTextureUsageRenderTarget. If the device's default
+// color-texture usage omits .renderTarget, a render pass into it produces nothing in a release build
+// (no Metal validation layer) -> black. (The simulator's earlier success came via the BLIT path,
+// which needs only copy-dest, not render-target.) So we explicitly add .renderTarget and log the
+// usage mask before/after to confirm. See docs/stereo-spike-interop.md §9.18.
+@available(visionOS 26.0, *)
+struct DuskLayerConfiguration: CompositorLayerConfiguration {
+    func makeConfiguration(capabilities: LayerRenderer.Capabilities,
+                           configuration: inout LayerRenderer.Configuration) {
+        // Only request .dedicated if the device actually supports it -- otherwise setting an
+        // unsupported layout makes the layer configuration throw (.layoutNotSupported) and NOTHING
+        // renders. If dedicated is unavailable we keep the system default (device-native layered).
+        let supportedLayouts = capabilities.supportedLayouts(options: [])
+        let hasDedicated = supportedLayouts.contains(.dedicated)
+        if hasDedicated {
+            configuration.layout = .dedicated
+        }
+        configuration.isFoveationEnabled = false
+        let beforeUsage = configuration.colorUsage
+        configuration.colorUsage.insert(.renderTarget)  // our render-pass clear/draw target
+        // Match the drawable's color format to the BGRA8 capture IOSurface so the present-side blit is a
+        // valid SAME-format copy. The default is RGBA16Float (rawValue 115, 8 bytes/px); blitting our
+        // 4-byte BGRA8 game frame into it is a cross-format copy -> garbled magenta + red/blue channel
+        // fringing (observed on device). Prefer the EXACT match (.bgra8Unorm) so the blit can never be a
+        // cross-format copy AND the captured display-ready bytes pass through untouched (matches how the
+        // frame looked correct on the sim); sRGB as fallback. Flip to sRGB if gamma looks off.
+        let colorFormats = capabilities.supportedColorFormats(options: [])
+        if colorFormats.contains(.bgra8Unorm) {
+            configuration.colorFormat = .bgra8Unorm
+        } else if colorFormats.contains(.bgra8Unorm_srgb) {
+            configuration.colorFormat = .bgra8Unorm_srgb
+        }
+        NSLog("[dusk::vision] makeConfiguration: dedicatedSupported=%d layouts=%ld foveationOff colorUsage 0x%lx->0x%lx colorFormat=%ld",
+              hasDedicated ? 1 : 0, supportedLayouts.count,
+              UInt(beforeUsage.rawValue), UInt(configuration.colorUsage.rawValue),
+              configuration.colorFormat.rawValue)
+    }
+}
+
 @available(visionOS 26.0, *)
 struct DuskCompositorContent: CompositorContent {
     var body: some CompositorContent {
-        CompositorLayer { layerRenderer in
+        CompositorLayer(configuration: DuskLayerConfiguration()) { layerRenderer in
             Thread.detachNewThread {
                 Thread.current.name = "DuskStereoPresent"
                 // `layerRenderer` is an Objective-C object (cp_layer_renderer_t) under the hood;
