@@ -4,11 +4,12 @@ How Dusklight renders genuine **per-eye stereoscopic 3D** of *Twilight Princess*
 end to end: the architecture, the render pipeline, every file/function that matters, and *why* each
 piece exists. Companion to `STEREO.md` (the original design doc) and `HANDOFF.md` (build/run state).
 
-> Status: per-eye stereo renders and **fuses** on real AVP hardware. The **default presentation is now a
-> world-locked screen** (comfortable, no camera-fighting); the original **face-locked panel** and an
-> optional **head-look** (head drives TP's camera) are preserved as alternate, build-selected modes. See
-> "Presentation modes" immediately below. visionOS-only — every change is guarded so other platforms are
-> byte-for-byte unaffected.
+> Status: per-eye stereo renders and **fuses** on real AVP hardware. The **default presentation is a
+> world-locked screen** (comfortable, no camera-fighting); **judder is fixed and head-lean parallax works**
+> after adopting reverse-Z depth + a single shared device anchor (§12). The original **face-locked panel**
+> and an optional **head-look** (head drives TP's camera) are preserved as alternate, build-selected modes.
+> See "Presentation modes" immediately below; §12–§13 cover how the present works, decisions, and next
+> steps. visionOS-only — every change is guarded so other platforms are byte-for-byte unaffected.
 
 ---
 
@@ -347,10 +348,19 @@ MVP = projection · inverse(originFromDevice · eyeTransform) · panelModel
   tracked head pose), **leveled to gravity** (world up, so a head tilt at anchor time doesn't cant the
   screen), facing the user, scaled to `kPanelHalfW` × `kPanelHalfH` (64:27).
 
-The quad **writes depth** (depth-stencil state, write enabled) — this drives the compositor's reprojection
-*and* satisfies the device "write depth or scan out black" rule (§9). Color is the eye texture sampled and
-written to the sRGB drawable (see the sRGB gotcha in §9). The legacy fullscreen blit is preserved as
-`renderFaceLockedPanel()` and selected when `visionWorldLockedScreen` is false.
+The quad **writes per-eye depth in reverse-Z** (cleared to `0.0` = far, `GreaterEqual`, stored) — the
+compositor consumes that depth for its **depth-based positional/parallax reprojection** as the head moves
+(and it satisfies the "write depth or scan out black" device rule, §9). Submitting standard-Z (clear `1.0`
+/ `LessEqual`) made the compositor mis-read the depth → **no head-translation parallax and judder**;
+reverse-Z is the fix. Color is the eye texture sampled and written to the sRGB drawable (sRGB gotcha, §9).
+The legacy fullscreen blit is preserved as `renderFaceLockedPanel()` (selected when
+`visionWorldLockedScreen` is false).
+
+**Single shared device anchor (critical).** The pose used to build the MVP and the anchor set on the
+drawable via `cp_drawable_set_device_anchor` MUST be the *same* `ar_device_anchor` object: query it once
+(`currentFramePose` returns both the pose and the anchor; the present loop sets that exact object). Two
+separate presentation-time queries diverge during head motion, so the compositor reprojects from a pose
+the quad was not rendered for and the frame **shears at the screen edges**. See §12 for the full contract.
 
 **Tunables** (`StereoPresent.mm`): `kPanelDistance`, `kPanelHalfW`, `kPanelHalfH`. The screen anchors
 where you face when it first appears (no recenter button yet — a controller-bound recenter is a possible
@@ -376,20 +386,104 @@ world-locked screen (§10) is the real fix: don't move the game camera at all; l
 head tracking. Head-look is kept for the face-locked mode and experimentation — enable with
 `visionWorldLockedScreen=false` **and** `visionHeadLook=true`, then rebuild.
 
-## 12. Known limitations / next steps
+## 12. How the visionOS present works — the CompositorServices reprojection contract
 
-- **Depth amount** (`kStereoEyeSep`) still being finalized; likely also wants a **disparity clamp** so
-  near objects can't diverge past fusion regardless of scene depth.
-- **In-game Dusk UI overlays** (RmlUi/ImGui) are not re-rendered per eye — only the GX scene + GX HUD
-  are. A flat-layer UI composite over both eyes is a follow-up. (The game's own GX HUD *does* appear,
-  on a fixed plane.)
-- **Convergence shift clips a full-width panel** at large values; once locked, render the panel
-  slightly inset (or bake the convergence into the per-eye projection) to avoid edge clipping.
-- **Frame pacing**: the per-eye render is ~2× the GPU work; the present/engine loops also need real
-  pacing (the OS has killed the app for excessive CPU wakes).
-- **Mid-frame teardown**: bail cleanly if the layer is invalidated (headset off) mid-frame
+The world-locked screen is driven by **two threads** and a strict per-frame contract with the compositor.
+Getting any part of the contract wrong shows up as judder, missing parallax, an edge seam, or a black
+screen — every symptom this port hit traced back to one of these rules.
+
+**Two threads** (`StereoEngine.h` declares the engine-side hooks; `StereoPresent.mm` runs the present):
+- **Engine thread** (the game loop, `m_Do_main.cpp`): runs Aurora/Dawn + the GameCube game, renders the
+  mono frame, and Aurora re-renders it per-eye into the two eye IOSurfaces (§3). It also mirrors the
+  presentation mode to the present thread (`stereo_set_world_locked`) and latches the head pose.
+- **Present thread** (`runStereoPresentLoop` → `presentStereoFrame`): owns CompositorServices + Metal +
+  the ARKit device-anchor query, composites the eye textures onto the world-locked quad, and presents.
+- They hand the eye textures across via IOSurface + an `MTLSharedEvent` fence (`StereoBridge`), and the
+  head anchor across via `g_anchorMutex` / `g_latestQueriedAnchor`.
+
+**The per-frame present loop** (`presentStereoFrame`) follows Apple's canonical CompositorServices
+sequence (verified against WWDC23 §10089 / WWDC24 §10092 "Render Metal with passthrough" + metal-by-example):
+1. `cp_layer_renderer_query_next_frame`
+2. `cp_frame_start_update` / `cp_frame_end_update` (pose-independent work)
+3. `cp_frame_predict_timing` → `cp_time_wait_until(cp_frame_timing_get_optimal_input_time(...))`
+4. `cp_frame_start_submission` → `cp_frame_query_drawables`
+5. query the device anchor at the **drawable's presentation time**
+   (`cp_drawable_get_frame_timing` → `cp_frame_timing_get_presentation_time` →
+   `ar_world_tracking_provider_query_device_anchor_at_timestamp`)
+6. render each eye's quad with the MVP (§10), set that **same** anchor on the drawable, `cp_drawable_encode_present`
+7. `[commandBuffer commit]` → `cp_frame_end_submission`
+
+**The three reprojection-correctness rules** (each was a real bug here):
+1. **Render at the predicted presentation-time pose AND set that exact anchor** — both, consistently. The
+   compositor then reprojects only the residual predicted-vs-actual delta. Parallax comes from BOTH the
+   per-frame re-render and the compositor's depth reprojection — never the anchor alone.
+2. **One shared anchor** for the MVP and `cp_drawable_set_device_anchor` (§10). Two queries diverge → shear.
+3. **Reverse-Z depth**, cleared to `0.0`, stored, correct per-pixel perspective depth — the compositor uses
+   it for positional/parallax reprojection (§10). Constant / standard-Z / unstored depth → no parallax.
+
+**What the compositor does NOT do** (adversarially verified): it does **not** synthesize 6DoF parallax from
+the anchor alone, and depth reprojection is an image-space correction that cannot reveal disoccluded
+geometry. So the app must keep re-rendering each frame from a fresh predicted pose; the compositor only
+refines between frames. No motion-vector / velocity submission API exists on `cp_drawable`.
+
+### Key present-thread functions (`src/dusk/vision/StereoPresent.mm`)
+- `runStereoPresentLoop` / `presentStereoFrame` — the present loop + the canonical frame sequence above.
+- `currentFramePose(drawable, &pose, &anchor)` — single device-anchor query at presentation time; returns
+  both the `originFromDevice` matrix (for the MVP) and the anchor object (to set on the drawable).
+- `ensurePanelPipeline` — lazily builds the textured-quad pipeline + the **reverse-Z** depth-stencil state.
+- `renderFaceLockedPanel` — the legacy fullscreen blit (face-locked mode).
+- `stereo_set_world_locked` — engine→present mode mirror (the present TU can't include `settings.h` —
+  it would pull `dolphin/types.h`'s `bool` typedef into the ARC/no-PCH unit).
+- `attachDeviceAnchor` — now used only by the pre-tracking / force-clear early-return paths.
+- `logicalEyeForView` — maps a drawable view to the left/right eye source by its eye-offset sign.
+- Engine-thread hooks (`StereoEngine.h`): `stereo_engine_frame_begin/end` (arm/flush the shared eye
+  capture), `stereo_engine_latch_head_pose` (snapshot the anchor for head-look).
+
+## 13. Decisions, current state & next steps
+
+### Key decisions
+- **Pivoted from head-look to a world-locked screen as the default.** Driving TP's 30 Hz camera from the
+  head under a 90 Hz face-locked panel "fought" fundamentally (it survived ~5 fixes — see §11). The
+  world-locked screen leaves the game camera untouched and lets the compositor do the head tracking —
+  comfortable, no fighting. Head-look is preserved behind config for the face-locked mode.
+- **Both presentations kept, switched by `game.visionWorldLockedScreen` (default `true`); rebuild to swap**
+  (§"Presentation modes"). No on-device toggle (user's choice).
+- **Reverse-Z depth + single shared anchor** were the two fixes (from deep, adversarially-verified web
+  research of Apple's CompositorServices docs/WWDC) that resolved the residual judder and missing parallax.
+
+### Current state (works on a real Apple Vision Pro)
+World-locked stereo screen: per-eye stereo, world-locked, **judder fixed**, head-lean **parallax working**
+(subtle at 2 m — verify by leaning ≥30 cm laterally / approaching the screen, or temporarily set
+`kPanelDistance` ≈ 0.7 m to exaggerate it). Colors correct, L/R fuse, edges stable, head-look off.
+
+### Files touched (this visionOS present work)
+- `src/dusk/vision/StereoPresent.mm` — world-locked quad render, dual-mode dispatch, present loop,
+  reverse-Z depth, single shared anchor, `ensurePanelPipeline`, `currentFramePose`, `renderFaceLockedPanel`.
+- `src/dusk/vision/StereoBridge.mm` — eye IOSurface imported as **`BGRA8Unorm_sRGB`** (color round-trip).
+- `src/dusk/vision/StereoEngine.h` — `stereo_set_world_locked` + the engine hooks.
+- `src/dusk/vision/HeadLook.{h,cpp}` — full-matrix head-look; gated off in world-locked mode.
+- `include/dusk/settings.h` + `src/dusk/settings.cpp` — `game.visionWorldLockedScreen` (default `true`),
+  `game.visionHeadLook` (default `false`).
+- `src/m_Do/m_Do_main.cpp` — mirrors the mode to the present thread; latches the head pose.
+- (engine) `extern/aurora/lib/{gfx,webgpu}` — per-eye stereo replay (§6).
+
+### Next steps / open questions
+- **Verify parallax magnitude** (lean test / closer `kPanelDistance`); pick a comfortable distance/size.
+- **Residual judder under 30 Hz content / 90 Hz present**: the research left the exact pacing for
+  low-update content *unsettled* — does a world-fixed screen need a re-encoded drawable every display
+  frame even when the game frame is unchanged? Investigate decoupling the present (90 Hz) from the 30 Hz game.
+- **Recenter control**: a controller-bound recenter so the screen can be repositioned on-device (it
+  currently anchors where you face at launch).
+- **Optional transparent background** (alpha 0 + zero depth on non-quad pixels) if mixing with passthrough
+  rather than full immersion.
+- **Foveation**: query + apply `cp_drawable_get_rasterization_rate_map` (currently ignored — minor artifacts).
+- **Per-eye in-screen stereo** (`kStereoEyeSep`) tuning + a disparity clamp; per-eye Dusk UI (RmlUi/ImGui)
+  overlay compositing (currently only the GX scene + GX HUD are per-eye).
+- **Mid-frame teardown**: keep bailing cleanly if the layer is invalidated (headset off) mid-frame
   (`cp_frame_end_submission` `BUG IN CLIENT`).
+- Everything is visionOS-guarded; other platforms are byte-for-byte unaffected.
 
-Build / sign / install / disc-push recipe and device IDs: see **`HANDOFF.md`** §8.
+Build / sign / install / disc-push recipe and device IDs: see **`HANDOFF.md`** §8. Restore-point tags on
+`personal` (stacklikemind/dusklight): `visionos-world-locked-screen`, `visionos-stereo-reprojection-fix`.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
